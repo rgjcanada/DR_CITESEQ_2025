@@ -1,0 +1,1159 @@
+## This project is used process the AL vs CR CITE_Seq experiment looking at CD45 TILs. 
+## Author: Brandon Oswald
+## Date: 31JAN2023-24OCT2024
+
+##Notes, I routinely used the orginal naming convention from the source I used this from. Naming of the seurat single cell matrix's could be changed to be more reflective of our actual data. I used pbmc_exp2 a lot,
+In realty, it just a holder for my AL vs DR TIL data. 
+
+##Load RDS files relevant for your work. If interested in processed CD45 cells, use that, if just CD8 use that. The choice is yours.
+pbmc_exp2 <- readRDS("location of your RDS file. I have RDS files saved with Zenodo for quick access")
+
+##Save loom file for velocity estimation. I used this line to help with velocity prcoessing in python. Your code will have to change to appropriate path for what you want to look at. 
+Neutro3p.loom <- as.loom(act_CD8_Tcells, filename = "/home/brandon.oswald/act_cd8_naming/Neutro3pSeurat.loom", verbose = FALSE)
+
+
+## Load Packages
+library(Seurat)
+library(SeuratObject)
+library(dplyr)
+library(patchwork)
+library(SeuratData)
+library(cowplot)
+library(dplyr)
+library(glmGamPoi)
+library(ggplot2)
+library(Nebulosa)
+library(devtools)
+library(EnhancedVolcano)
+library(Pandas)
+library(decontX)
+library(presto)
+library(ComplexHeatmap)
+library(org.Mm.eg.db)
+library(circlize)
+library(ggsignif)
+library(ggpubr)
+library(clusterProfiler)
+library(writexl)
+library(scater)
+library("scater")
+library("scran")
+library(ggplot2)
+library(Nebulosa)
+
+
+## Start the data processing CITESeq Data, (post Cell Ranger)
+## Set Seed
+set.seed(31012023)
+
+## coped raw files 
+pbmc.umis <- Read10X(data.dir = "my_path_to_raw_files")
+raw.data <- pbmc.umis
+
+## Split GEX and ADT/HTO
+GEX.data <- raw.data$"Gene Expression"  
+ADT.HTO.data <- raw.data$"Antibody Capture"
+ADT.data <- ADT.HTO.data[-grep("HTO",rownames(ADT.HTO.data)),] #split ADT
+HTO.data <- ADT.HTO.data[grep("HTO",rownames(ADT.HTO.data)),] #split ADT
+
+## Once split, create seurat object for analysis
+pbmc <- CreateSeuratObject(counts = GEX.data, project = "CITE_SEQ_CD45_TILS", min.cells = 3, min.features = 200)
+
+## Identify percentage of cells expressing mitochondrial genes, also features (genes), and counts.
+## This is used for QC purposes. 
+
+pbmc <- PercentageFeatureSet(pbmc, pattern = "^mt-", col.name = "percent.mt")
+VlnPlot(pbmc, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+plot1 <- FeatureScatter(pbmc, feature1 = "nCount_RNA", feature2 = "percent.mt")
+plot2 <- FeatureScatter(pbmc, feature1 = "nCount_RNA", feature2 = "nFeature_RNA")
+plot1 + plot2
+
+## Incorporate ADT and HTO
+joint.bcs <- intersect(colnames(pbmc), colnames(ADT.data))
+ADT.data <- ADT.data[, joint.bcs]
+HTO.data <- HTO.data[, joint.bcs]
+pbmc[["ADT"]] <- CreateAssayObject(counts=ADT.data)
+pbmc[["HTO"]] <- CreateAssayObject(counts=HTO.data)
+pbmc <- NormalizeData(pbmc, assay = "HTO", normalization.method = "CLR")
+pbmc <- HTODemux(pbmc, assay = "HTO", positive.quantile = 0.999)
+
+##Cell Breakdown, your breakdown should be similar
+table(pbmc$HTO_classification.global)
+#Doublet Negative  Singlet 
+#26321   138069    45867
+
+## Sort out low nCount, low RNA, and keep only singlets with mito percentage less than 20%
+pbmc_exp2 <- subset(pbmc, subset = nCount_ADT >=150 & nCount_RNA >=200 & HTO_classification.global== "Singlet" & percent.mt < 20)
+table(pbmc_exp2$HTO_classification)
+#HTO1 HTO2 HTO3 HTO4 HTO5 HTO6 HTO7 HTO8 
+#7841 5544 5307 5225 6408 5300 7103 2727 
+
+## SCT Transform RNA data
+DefaultAssay(pbmc_exp2) <- 'RNA'
+pbmc_exp2 <- SCTransform(pbmc_exp2, method = "glmGamPoi", vars.to.regress = "percent.mt", verbose = FALSE)
+
+## Set SCT as default assay for future analysis and create pca plot
+DefaultAssay(pbmc_exp2) <- 'SCT'
+pbmc_exp2 <- FindVariableFeatures(pbmc_exp2)
+pbmc_exp2 <- ScaleData(pbmc_exp2) 
+pbmc_exp2 <- RunPCA(pbmc_exp2, dims = 1:40, reduction.name = 'rna_PCA', verbose = FALSE)
+
+DefaultAssay(pbmc_exp2) <- 'ADT'
+# we will use all ADT features for dimensional reduction
+# we set a dimensional reduction name to avoid overwriting the 
+VariableFeatures(pbmc_exp2) <- rownames(pbmc_exp2[["ADT"]])
+pbmc_exp2 <- NormalizeData(pbmc_exp2, normalization.method = 'CLR', margin = 2) %>% 
+  ScaleData() %>% RunPCA(reduction.name = 'apca', dims = 1:40)
+pbmc_exp2
+
+# Identify multimodal neighbors. These will be stored in the neighbors slot, 
+# and can be accessed using bm[['weighted.nn']]
+# The WNN graph can be accessed at bm[["wknn"]], 
+# and the SNN graph used for clustering at bm[["wsnn"]]
+# Cell-specific modality weights can be accessed at bm$RNA.weight
+pbmc_exp2_test <- FindMultiModalNeighbors(
+  pbmc_exp2, reduction.list = list("rna_PCA", "apca"), 
+  dims.list = list(1:40, 1:40)
+)
+
+## Run UMAP and Find clusters
+pbmc_exp2 <- RunUMAP(pbmc_exp2_test, nn.name = "weighted.nn", reduction.name = "wnn.umap2", reduction.key = "wnnUMAP2_", spread = 2, n.neighbors = 20, min.dist = 0.01,  n.epochs = 200, seed.use = 42)
+pbmc_exp2 <- FindClusters(pbmc_exp2, graph.name = "wsnn", algorithm = 3, resolution = 0.4, verbose = FALSE)
+pbmc_exp2
+
+## View UMAP
+DimPlot(pbmc_exp2, reduction = 'wnn.umap2', label = TRUE, repel = TRUE, label.size = 4) + NoLegend()
+
+##start to identify features
+FeaturePlot(pbmc_exp2, reduction = 'wnn.umap2', features = c("adt_CD8a-53-6.7", "adt_CD279-(PD-1)-RMP1-30"), min.cutoff = "q10", max.cutoff = "q95")
+FeaturePlot(pbmc_exp2, features = "sct_Cd8a", reduction = 'wnn.umap2', min.cutoff = "q5", max.cutoff = "q95", cols = c("lightgrey","darkgreen"), ncol = 2)
+FeaturePlot(pbmc_exp2, features = c("CD103-2E7", "CD150-SLAM-TC15-12F12.2","CD4-RM4-5","CD11c-N418"), reduction = 'wnn.umap2', min.cutoff = "q10", max.cutoff = "q95", cols = c("lightgrey","darkgreen"), ncol = 2)
+VlnPlot(pbmc_exp2, features = "Pdcd1", assay = "SCT", pt.size = 0.01, slot = "counts")
+# can you slot = "scale.data", "data", or nothing. SCT tranform (VlnPlot)
+
+
+## This line was used to create metadata for splitting AL treatment vs CR treatment, now called Dietary restriciton in paper. 
+pbmc_exp2$diet <- ifelse(test = pbmc_exp2$HTO_classification %in% c("HTO1", "HTO2","HTO3", "HTO4"), yes = "Ad_libitum", no = "Caloric_Restriction")
+x <- pbmc_exp2$diet == "Ad_libitum"
+summary(pbmc_exp2$diet)
+sum(x, na.rm=TRUE)
+#21538 is caloric restriction
+#23917 is ad-libitium
+
+table(pbmc_exp2$HTO_classification)
+#HTO1 HTO2 HTO3 HTO4 HTO5 HTO6 HTO7 HTO8 
+#7841 5544 5307 5225 6408 5300 7103 2727 
+
+## Create metadata of specific cluster (ex. cluster 8), and separate out by sample (Ex. HTO1, 2, etc). This will allow same cluster analysis of gene expression
+## Identify cluster 8 * diet markers
+# make some cluster * diet
+pbmc_exp2$clust.diet <- paste(Idents(pbmc_exp2), pbmc_exp2$diet, sep = "_")
+pbmc_exp2$clust.diet
+
+# save original clusters
+pbmc_exp2$clusters <- Idents(pbmc_exp2)
+pbmc_exp2$clusters
+
+# re specify Idents to cluster_diet
+Idents(pbmc_exp2) <- pbmc_exp2$clust.diet
+Idents(pbmc_exp2)
+
+# Change Idents as necessary, this may change based on what I am looking at, it is up to the user to decide what they want to analyze. I went back and forth numberous times in my ananysis looking
+at different things. You will see that reflected throughout the analysis. 
+Idents(pbmc_exp2) <- pbmc_exp2$seurat_clusters
+
+# Identify markers between indenties of interest
+cluster0.markers <- FindMarkers(pbmc_exp2, ident.1 = "0_Ad_libitum", ident.2 = "0_Caloric_Restriction", min.pct = 0.001)
+cluster1.markers <- FindMarkers(pbmc_exp2, ident.1 = "1_Ad_libitum", ident.2 = "1_Caloric_Restriction", min.pct = 0.001)
+cluster2.markers <- FindMarkers(pbmc_exp2, ident.1 = "2_Ad_libitum", ident.2 = "2_Caloric_Restriction", min.pct = 0.001)
+cluster3.markers <- FindMarkers(pbmc_exp2, ident.1 = "3_Ad_libitum", ident.2 = "3_Caloric_Restriction", min.pct = 0.001)
+cluster4.markers <- FindMarkers(pbmc_exp2, ident.1 = "4_Ad_libitum", ident.2 = "4_Caloric_Restriction", min.pct = 0.001)
+cluster5.markers <- FindMarkers(pbmc_exp2, ident.1 = "5_Ad_libitum", ident.2 = "5_Caloric_Restriction", min.pct = 0.001)
+cluster6.markers <- FindMarkers(pbmc_exp2, ident.1 = "6_Ad_libitum", ident.2 = "6_Caloric_Restriction", min.pct = 0.001)
+cluster7.markers <- FindMarkers(pbmc_exp2, ident.1 = "7_Ad_libitum", ident.2 = "7_Caloric_Restriction", min.pct = 0.001)
+cluster8.markers <- FindMarkers(pbmc_exp2, ident.1 = "8_Ad_libitum", ident.2 = "8_Caloric_Restriction", min.pct = 0.001)
+cluster9.markers <- FindMarkers(pbmc_exp2, ident.1 = "9_Ad_libitum", ident.2 = "9_Caloric_Restriction", min.pct = 0.001)
+cluster10.markers <- FindMarkers(pbmc_exp2, ident.1 = "10_Ad_libitum", ident.2 = "10_Caloric_Restriction", min.pct = 0.001)
+cluster11.markers <- FindMarkers(pbmc_exp2, ident.1 = "11_Ad_libitum", ident.2 = "11_Caloric_Restriction", min.pct = 0.001)
+cluster12.markers <- FindMarkers(pbmc_exp2, ident.1 = "12_Ad_libitum", ident.2 = "12_Caloric_Restriction", min.pct = 0.001)
+cluster13.markers <- FindMarkers(pbmc_exp2, ident.1 = "13_Ad_libitum", ident.2 = "13_Caloric_Restriction", min.pct = 0.001)
+cluster14.markers <- FindMarkers(pbmc_exp2, ident.1 = "14_Ad_libitum", ident.2 = "14_Caloric_Restriction", min.pct = 0.001)
+cluster15.markers <- FindMarkers(pbmc_exp2, ident.1 = "15_Ad_libitum", ident.2 = "15_Caloric_Restriction", min.pct = 0.001)
+cluster16.markers <- FindMarkers(pbmc_exp2, ident.1 = "16_Ad_libitum", ident.2 = "16_Caloric_Restriction", min.pct = 0.001)
+cluster17.markers <- FindMarkers(pbmc_exp2, ident.1 = "17_Ad_libitum", ident.2 = "17_Caloric_Restriction", min.pct = 0.001)
+cluster18.markers <- FindMarkers(pbmc_exp2, ident.1 = "18_Ad_libitum", ident.2 = "18_Caloric_Restriction", min.pct = 0.001)
+cluster19.markers <- FindMarkers(pbmc_exp2, ident.1 = "19_Ad_libitum", ident.2 = "19_Caloric_Restriction", min.pct = 0.001)
+
+
+##How to find markers ADTs for differential analysis?
+DefaultAssay(pbmc_exp2) <- 'ADT'
+View(cluster3.markers)
+
+## Plot umap & change identity back to clusters
+Idents(pbmc_exp2) <- pbmc_exp2$seurat_clusters
+DimPlot(pbmc_exp2, reduction = "wnn.umap2", label = T)
+
+cluster18.markers
+## Volcano plot (postive FC means more highly expressed in first group)
+EnhancedVolcano(cluster0.markers, rownames(cluster0.markers), x ="avg_log2FC", 
+                y ="p_val_adj", FCcutoff = 1, title = "Volcano plot - cluster 0")
+EnhancedVolcano(cluster1.markers, rownames(cluster1.markers), x ="avg_log2FC", 
+                y ="p_val_adj", FCcutoff = 0.3, title = "Volcano plot - cluster 1")
+EnhancedVolcano(cluster2.markers, rownames(cluster2.markers), x ="avg_log2FC", 
+                y ="p_val_adj", FCcutoff = 0.3, title = "Volcano plot - cluster 2")
+EnhancedVolcano(cluster3.markers, rownames(cluster3.markers), x ="avg_log2FC", 
+                y ="p_val_adj", FCcutoff = 0.4, title = "Volcano plot - cluster 3")
+EnhancedVolcano(cluster4.markers, rownames(cluster4.markers), x ="avg_log2FC", 
+                y ="p_val_adj", FCcutoff = 0.4, title = "Volcano plot - cluster 4")
+EnhancedVolcano(cluster5.markers, rownames(cluster5.markers), x ="avg_log2FC", 
+                y ="p_val_adj", FCcutoff = 0.4, title = "Volcano plot - cluster 5")
+EnhancedVolcano(cluster6.markers, rownames(cluster6.markers), x ="avg_log2FC", 
+                y ="p_val_adj", FCcutoff = 0.4, title = "Volcano plot - cluster 6")
+EnhancedVolcano(cluster7.markers, rownames(cluster7.markers), x ="avg_log2FC", 
+                y ="p_val_adj", FCcutoff = 0.4, title = "Volcano plot - cluster 7")
+EnhancedVolcano(cluster9.markers, rownames(cluster9.markers), x ="avg_log2FC", 
+                y ="p_val_adj", FCcutoff = 0.4, title = "Volcano plot - cluster 9")
+EnhancedVolcano(cluster10.markers, rownames(cluster10.markers), x ="avg_log2FC", 
+                y ="p_val_adj", FCcutoff = 0.4, title = "Volcano plot - cluster 10")
+EnhancedVolcano(cluster16.markers, rownames(cluster16.markers), x ="avg_log2FC", 
+                y ="p_val_adj", FCcutoff = 0.4)
+
+
+## Save Volcano Plot
+ggsave(file="to_a_location_you_think_correct", dpi = 600, width = 4, height = 6)
+
+#name some cluster (Was not used because of naming issues)
+pbmc_exp2$celltypes <- NA
+pbmc_exp2$celltypes[pbmc_exp2$seurat_clusters %in% 3] <- "Teff"
+
+pbmc_exp2$seurat_clusters
+##Remove clusters not of significance 
+# Identify the clusters to remove, this was mostly based on very low cell number. 
+cluster_ids_to_remove <- c(14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26)
+
+# Remove the cells in the specified clusters
+pbmc_removed_clusters <- subset(pbmc_exp2, idents = 0:13)
+DimPlot(pbmc_removed_clusters, reduction = "wnn.umap2", label = TRUE, repel = TRUE, label.size = 4)
+
+# Save the modified dataset
+saveRDS(pbmc_removed_clusters, file = "pbmc_removed_clusters.rds")
+
+## How to merge clusters 
+cluster_ids_to_merge <- c(11, 4, 5)
+pbmc_removed_clusters_collaspsed_clusters <- RenameIdents(object = pbmc_removed_clusters, new.idents = c(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13), merge.idents = cluster_ids_to_merge)
+
+##This next block of code I am including because it might be helpful for someone in the future but we did not end up using this naming convention. May help someone name clusters as they see fit. 
+new.cluster.ids <- c("NK", "unknown1", "uk1", "Teff", "Macrophage1", "Macrophage2", "Tcf7 High Transition", "Tex-Tox High", "uk2", "uk3", "Treg", "Macrophage3", "uk4", "uk5")
+names(new.cluster.ids) <- levels(pbmc_removed_clusters)
+pbmc_removed_clusters <- RenameIdents(pbmc_removed_clusters, new.cluster.ids)
+DimPlot(pbmc_removed_clusters, reduction = "wnn.umap2", label = TRUE, repel = TRUE, label.size = 7)
+
+## Make cell types new identity 
+Idents(pbmc_exp2) <- pbmc_exp2$celltypes
+
+## VlnPlot of gene and split by diet
+VlnPlot(pbmc_exp2, features = "Cd8a", assay = 'SCT', idents = c("1"))
+ggsave(file="")
+
+VlnPlot(pbmc_exp2, features = "Pdcd1")
+FeaturePlot(pbmc_exp2, features = "Cd8a", reduction = "wnn.umap2", label = T, split.by = 'diet') + NoLegend()
+FeaturePlot(pbmc_exp2, features = "rna_Cd8a", reduction = "wnn.umap2", label = T, split.by = 'diet')
+DimPlot(pbmc_removed_clusters, reduction = "wnn.umap2", label = T, split.by = 'diet') 
+
+## Find all markers of each cluster (used this data and others to infer clusters idents)
+pbmc.markers <- FindAllMarkers(pbmc_exp2, only.pos = TRUE, min.pct = 0.15, logfc.threshold = 0.15)
+pbmc.markers.sct <- FindAllMarkers(pbmc_exp2, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25, assay = "SCT")
+pbmc.markers.sct[pbmc.markers.sct$cluster == '1',]$gene
+
+feature = c("Foxp3", "Ctla4", "Mtnfrsf4", "Irf4", "Batf", "Tnfrsf18", "Tox2", "Prdmi", "Lef1", "Atm", "Sell", "Klf2", "Itga6", "Il7r", "Cd52",
+            "S100a4", "Tgfb3", "Aqp3", "Nlrp3", "Klf2", "Itgb7", "Ccl5", "Gzmk", "Gnly", "Eomes", "Znf683", "Klrg1", "Nk67", "Zeb2")
+
+clusters = c("0", "3", "35", "11", "13", "2", "10", "7", "8", "5", "1")
+
+pbmc.markers.sct2 <- subset(pbmc.markers.sct, subset = pbmc.markers.sct$gene %in% feature)
+pbmc.markers.sct2 <- subset(pbmc.markers.sct2, subset = pbmc.markers.sct$cluster %in% clusters)
+pbmc_exp2_reducedclusters <- subset(pbmc_exp2, subset = pbmc_exp2$clusters %in% clusters)
+
+pbmc.markers.sct2 %>%
+  group_by(cluster) %>%
+  top_n(n = 10, wt = avg_log2FC) -> top10
+
+
+DoHeatmap(pbmc_exp2, assay = "SCT" ,features = top10$gene, size = 2.5) + NoLegend()
+
+#QC'ing the data
+FeaturePlot(pbmc_exp2, features = "nCount_RNA", min.cutoff = "q05", max.cutoff = "q95")   & scale_colour_gradientn(colours = c("light gray", brewer.pal(n = 9, name = "Greens")[4:9]))
+FeaturePlot(pbmc_exp2, features = "nFeature_RNA", min.cutoff = "q05", max.cutoff = "q95")& scale_colour_gradientn(colours = c("light gray", brewer.pal(n = 9, name = "Greens")[4:9]))
+FeaturePlot(pbmc_exp2, features = "nCount_ADT", min.cutoff = "q05", max.cutoff = "q95")& scale_colour_gradientn(colours = c("light gray", brewer.pal(n = 9, name = "Purples")[4:9]))
+FeaturePlot(pbmc_exp2, features = "nFeature_ADT", min.cutoff = "q05", max.cutoff = "q95")& scale_colour_gradientn(colours = c("light gray", brewer.pal(n = 9, name = "Purples")[4:9]))
+mean(pbmc_exp2$nCount_RNA)
+mean(pbmc_exp2$nCount_ADT)
+mean(pbmc_exp2$nCount_SCT)
+mean(pbmc_exp2$nFeature_RNA)
+
+## FeaturePlot of genes and antibodies of interest 
+FeaturePlot(pbmc_exp2, features = c("CD69-H1.2F3", "CD103-2E7", "CD279-(PD-1)-RMP1-30", "TCR-Vbeta5.1-5.2-MR9-4"), reduction = 'wnn.umap2', min.cutoff = "q10", max.cutoff = "q95", cols = c("lightgrey","darkgreen"), ncol = 2)
+FeaturePlot(pbmc_exp2, features = c(""), reduction = 'wnn.umap2', min.cutoff = "q20", max.cutoff = "q95", cols = c("lightgrey","darkgreen"), ncol = 1)
+FeaturePlot(pbmc_exp2, features = c("CD69-H1.2F3"), reduction = 'wnn.umap2', min.cutoff = "q20", max.cutoff = "q95", cols = c("lightgrey","darkgreen"))
+
+#Various genesets used to look at data
+geneSets <- c("adt_CD4-RM4-5", "adt_human-CD11b-M1-70", "adt_human-CD44-IM7", "adt_CD62L-MEL-14", "adt_F4-80-BM8", "adt_TER-119-Erythroid-Cells-TER-119", "adt_CD3-17A2", "adt_CD150-(SLAM)-TC15-12F12.2")
+geneSets <- c("adt_CD279-(PD-1)-RMP1-30","adt_F4-80-BM8","adt_NK-1.1-PK136","adt_CD127-(IL-7Ralpha)-A7R34", "adt_TCR-gamma-Delta-GL3", "adt_CD45.2-104", "adt_CD8b-(Ly-3)-YTS156.7.7", "adt_CD223-(LAG-3)-C9B7W", "adt_CD366-(Tim-3)-RMT3-23", "adt_Mouse-IgG1-kappa-isotype-Ctrl-MOPC-21", "adt_human-KLRG1-(MAFA)-2F1-KLRG1", "adt_CD127-(IL-7Ralpha)-A7R34", "adt_CD279-(PD-1)-RMP1-30","adt_F4-80-BM8","adt_NK-1.1-PK136","adt_CD127-(IL-7Ralpha)-A7R34")
+geneSets <- c("Cd8a", "Cd4", "Cd19", "Itgax","Foxp3", "Ctla4", "Irf4", "Batf", "Tnfrsf18", "Tox2", "Lef1", "Atm", "Sell", "Klf2", "Itga6", "Il7r", "Cd52", "S100a4", "Tgfb3", "Aqp3", "Nlrp3", "Klf2", "Itgb7", "Ccl5", "Gzmk", "Eomes", "Klrg1", "Ptgir","Cd4", "Pdcd1", "Cd8a", "Nk1.1", "Lag3", "Gzmb", "Ifng", "Foxp3", "Cs", "Cd8a", "Cd44", "Sell", "Tcf7", "Tbx21", "Eomes", "Bcl6", "Id2", "Id3", "Stat3", "Stat4", "Prdm1", "Slamf6", "Cd27", "Ccr7", "Cx3cr1", "Klrg1", "Il7r", "Il2ra", "Tox", "Pdcd1", "Prf1", "Gzmb", "Ifng", "Tnf", "Acly", "Acss2", "Ldha", "Cpt1a", "Mpc1", "Mpc2", "Cs", "Slc25a1", "Acss1", "Hk2")
+geneSets <- c("Lag3", "Gzmb", "Ifng", "Foxp3", "Cs", "Cd8a", "Cd44", "Sell", "Tcf7", "Tbx21", "Eomes", "Bcl6", "Id2", "Id3", "Stat3", "Stat4", "Prdm1", "Slamf6", "Cd27", "Ccr7", "Cx3cr1", "Klrg1", "Il7r", "Il2ra", "Tox", "Pdcd1", "Prf1", "Gzmb", "Ifng", "Tnf", "Acly", "Acss2", "Ldha", "Cpt1a", "Mpc1", "Mpc2", "Cs", "Slc25a1", "Acss1", "Hk2")
+
+
+## This is used to plot many markers of interest and save them. 
+for (geneSet in geneSets){
+  plot0 <- FeaturePlot(pbmc_exp2,features = geneSet, reduction = 'wnn.umap2', min.cutoff = "q20", max.cutoff = "q95", cols = c("lightgrey","darkgreen"), ncol = 1)
+  plot0
+  ggsave(file=paste0("_X_",geneSet,"feature_plot_cd45.pdf"))
+}
+
+saveRDS(pbmc_exp2, file = "filtered_cite_seq_cd45_ALvsCR.rds")
+
+## Violin Plots AL vs DR (gene of interest) + Identify of interest 
+VlnPlot(pbmc_exp2, assay = "SCT", features = "sct_Tox", split.by = "diet", idents = c("3"))
+
+# How many cells are in each cluster
+table(Idents(pbmc_exp2))
+table(pbmc_exp2$diet)
+
+# What proportion of cells are in each cluster?
+prop.table(table(Idents(pbmc_removed_clusters)))
+
+# How does cluster membership vary by replicate?
+table(Idents(pbmc_removed_clusters), pbmc_removed_clusters$diet)
+table(Idents(pbmc_exp2), pbmc_exp2$diet)
+DimPlot(pbmc_exp2, reduction = "wnn.umap2", label = T, split.by = "diet")
+
+# What proportion of cells are in each cluster by diet
+test <-prop.table(table(Idents(pbmc_removed_clusters), pbmc_removed_clusters$diet), margin = 2)
+test
+
+# What proportion of cells are in each cluster by diet
+cellsbydiet <-prop.table(table(Idents(pbmc_removed_clusters), pbmc_removed_clusters$diet), margin = 2)
+cellsbydiet
+
+Ad_lib <- data.frame(Cell_Type = c(0, 1, 2, 3, 4, 5, 6, 7,8,9))
+DR <- data.frame(Cell_Type =c(0, 1, 2, 3, 4, 5, 6, 7,8,9))
+
+# How can I calculate the average expression of all cells within a cluster?
+cluster.averages <- AverageExpression(pbmc_exp2, assays = "SCT")
+cluster.averages[["SCT"]][,1:26]
+
+#plot the density of gene of interest in clusters
+plot_density(pbmc_exp2, c("sct_Ifng","sct_Gzmb","sct_Tnf"), joint = TRUE)
+
+plot_density(pbmc_exp2, c("adt_CD155-(PVR)-TX56"), joint = TRUE)
+  ggsave(file="/data/home/brandon.oswald/Il2ra.pdf")
+
+  FeaturePlot(pbmc_exp2, features = c("CD49b-HMalpha2"), reduction = 'wnn.umap2', min.cutoff = "q20", max.cutoff = "q95", cols = c("lightgrey","darkgreen"))
+write.table(rownames(pbmc_exp2@assays$ADT))
+
+#FeaturePlot for genes
+for (geneSet in geneSets){
+  plot0 <- FeaturePlot(pbmc_exp2,features = geneSet, reduction = 'wnn.umap2', min.cutoff = "q10", max.cutoff = "q99", cols = c("lightgrey","darkgreen"), ncol = 1)
+  plot0
+  ggsave(file=paste0("/data/home/brandon.oswald/rna_cd45_plots/subsetofgenes/",geneSet,"feature_plot.pdf"))
+}
+
+geneSets <- c("Itgam", "Cd68")
+
+for (geneSet in geneSets){
+  plot0 <- FeaturePlot(pbmc_exp2,features = geneSet, reduction = 'wnn.umap2', min.cutoff = "q20", max.cutoff = "q95", cols = c("lightgrey","darkgreen"), ncol = 1)
+  plot0
+  ggsave(file=paste0("/data/home/brandon.oswald/rna_cd45_plots/",geneSet,"feature_plot_cd45.pdf"))
+}
+
+
+##generating excel documents for cluster markers (Differential expressed genes), used this line of code later for other excel lists based on further subsetted data. 
+numbersets <- c("0", "1", "2", "3", "4", "5", "6", "7")
+numbersets <- c("0", "1")
+
+for (numberset in numbersets){
+  Markercluster <- FindMarkers(act_cd8_naming, ident.1 = numberset, min.pct = 0.05)
+  markers_df <- data.frame(Gene = rownames(Markercluster), Markercluster)
+  write_xlsx(markers_df, path=paste0("/data/home/brandon.oswald/act_cd8_naming/ClusterMarkers/",numberset,"clustermarkers.xlsx"))
+}
+
+##Find Markers for Each cluster (Broad-Analysis)
+Markercluster1 <- FindMarkers(pbmc_exp2, ident.1 = "2", min.pct = 0.025)
+Markercluster1
+
+##Save differential gene expression to excel based on FindMarkers function
+markers_df <- data.frame(Gene = rownames(Markercluster1), Markercluster1)
+write_xlsx(markers_df, "/home/brandon.oswald/cluster2FindMarkers.xlsx")
+
+##Markers from Thales paper for macrophages
+FeaturePlot(pbmc_exp2, features = c("Ear2", "Atp6v0d2", "Mrc1", "Spp1", "Fabp4", "Ctsk"), reduction = 'wnn.umap2', min.cutoff = "q10", max.cutoff = "q95", cols = c("lightgrey","darkgreen"))
+##Neutrophils
+FeaturePlot(pbmc_exp2, features = c("S100a9", "S100a8", "G0s2", "Ptgs2"), reduction = 'wnn.umap2', min.cutoff = "q10", max.cutoff = "q95", cols = c("lightgrey","darkgreen"))
+##T cells
+FeaturePlot(pbmc_exp2, features = c("Cd3g", "Cd3d", "Cd3e", "Trac", "Trbc2"), reduction = 'wnn.umap2', min.cutoff = "q10", max.cutoff = "q95", cols = c("lightgrey","darkgreen"))
+##cDCs
+FeaturePlot(pbmc_exp2, features = c("Naaa", "Batf3", "Itgae", "Cd209a"), reduction = 'wnn.umap2', min.cutoff = "q10", max.cutoff = "q95", cols = c("lightgrey","darkgreen"))
+##Monocyte
+FeaturePlot(pbmc_exp2, features = c("Ccr2", "Ms4a4c", "F13a1","Vcan", "Clec4a1"), reduction = 'wnn.umap2', min.cutoff = "q10", max.cutoff = "q95", cols = c("lightgrey","darkgreen"))
+##NKcells
+FeaturePlot(pbmc_exp2, features = c("Gzma", "Ccl5", "Nkg7","Klre1", "Ncr1", "Klre1", "Ncr1", "Klrk1", "Prf1","Klrb1c"), reduction = 'wnn.umap2', min.cutoff = "q10", max.cutoff = "q95", cols = c("lightgrey","darkgreen"))
+##CD4 Naive
+FeaturePlot(pbmc_exp2, features = c("Lef1", "Igfbp4", "Ccr7", "S1pr1", "Sell"), reduction = 'wnn.umap2', min.cutoff = "q10", max.cutoff = "q95", cols = c("lightgrey","darkgreen"))
+
+##More line of code to idenfity key things of interest 
+DefaultAssay(pbmc_exp2) <- 'SCT'
+plot_density(pbmc_exp2, features = c("Ly6c2"), reduction = 'wnn.umap2')
+FeaturePlot(pbmc_exp2, features = c("Lag3", "Nkg7"), reduction = 'wnn.umap2')
+FeaturePlot(pbmc_exp2, features = c("Tmem176b"), reduction = 'wnn.umap2', min.cutoff = "q10", max.cutoff = "q95", cols = c("lightgrey","darkgreen"), split.by = "diet")
+DimPlot(pbmc_exp2, reduction = 'wnn.umap2', label = T)
+CD8_Tcells.markers <- FindAllMarkers(pbmc_exp2, only.pos = TRUE, min.pct = 0.15, logfc.threshold = 0.15)
+
+##Save differential gene expression to excel based on FindMarkers function
+markers_df <- data.frame(Gene = rownames(cluster8v13), cluster8v13)
+write_xlsx(markers_df, "/home/brandon.oswald/cluster8v13.xlsx")
+
+DotPlot(act_CD8_Tcells, dot.scale = ,features = c("Cd44", "Tox", "Havcr2", "Pdcd1", "Gzmb", "Ifng", "Oxct1", "Bdh1", "Cs", "Gclc", "Mki67", "Cdca3", "Cdca7", "Cdk1", "Cdc25b", "Ccnf", "Ccna2", "Hk2", "Ldha"), 
+        cluster.idents = T, ) + RotatedAxis() + coord_flip() + scale_colour_gradient2(low = "Blue3", mid = "gray99", high = "red4")
+
+##different gene of interest. 
+"Cd40lg", "Crip1", "Tmem176a", "Vim", "Cd5", "Igfbp4", "Lef1", "Ccr7", "S1pr1", "Sell", "Tnfrsf4", 
+"Tnfrsf9", "Foxp3", "Ikzf2", "Ctla4", "Ccl4", "Cd8a", "Cd8b1", "Lag3", "Nkg7", "Ccl5", "Gzmk", "Ctsw", 
+"Trdv4", "Cd163l1", "Tmem176b", "Ckb", "Arg1", "Stab2", "Gata3", "Hs3st1", "Il1rl1", "Ifitm3", "Ifitm2", 
+"Ly6c2", "Klra9", "Gzmb", "Izumo1r", "Tbc1d4", "Ifi27l2a", "Hif1a", "Tnfsf8", "Dapl1", "Gzma", "Fcer1g", 
+"Tyrobp", "Ncr1", "Klrb1c", "Cd7", "Bcl2", "Stmn1", "Pclaf", "Hist1h2ae", "Hmgb2"
+
+
+
+
+
+
+
+
+
+##Generate new UMAP of subclustered data (looking to subcluster CD8 T cells) 
+DimPlot(pbmc_exp2, reduction = 'wnn.umap2', label = T)
+#subcluster
+DimPlot(pbmc_exp2, reduction = "wnn.umap2", label = T) 
+#sublcuster 3, 6, 7, 9 
+CD8_Tcells <- subset(pbmc_exp2, idents = c("3", "6", "7", "9"))
+
+
+## SCT Transform RNA data, Diet Seurat only brings in assays of intrest and drops all other data. This allowed me to start fresh again. 
+DefaultAssay(CD8_Tcells) <- 'RNA'
+CD8_Tcells2 <-DietSeurat(CD8_Tcells, assays = c("RNA","ADT"))
+CD8_Tcells2
+DefaultAssay(CD8_Tcells2) <- 'RNA'
+CD8_Tcells2 <- SCTransform(CD8_Tcells2, method = "glmGamPoi", vars.to.regress = "percent.mt", verbose = FALSE)
+
+## Set SCT as default assay for future analysis and create pca plot
+DefaultAssay(CD8_Tcells2) <- 'SCT'
+CD8_Tcells <- FindVariableFeatures(CD8_Tcells2)
+CD8_Tcells <- ScaleData(CD8_Tcells) ##Did not run after SCT Transform
+CD8_Tcells <- RunPCA(CD8_Tcells, reduction.name = "pca", dims = 1:40, verbose = FALSE)
+CD8_Tcells
+
+DefaultAssay(CD8_Tcells) <- 'ADT'
+# we will use all ADT features for dimensional reduction
+# we set a dimensional reduction name to avoid overwriting the 
+VariableFeatures(CD8_Tcells) <- rownames(CD8_Tcells[["ADT"]])
+CD8_Tcells <- NormalizeData(CD8_Tcells, normalization.method = 'CLR', margin = 2) 
+CD8_Tcells <- ScaleData(CD8_Tcells)
+CD8_Tcells <- RunPCA(CD8_Tcells, reduction.name = 'apca', reduction.key = 'apca_', dims = 1:40, verbose = FALSE)
+CD8_Tcells
+
+# Identify multimodal neighbors. These will be stored in the neighbors slot, 
+# and can be accessed using bm[['weighted.nn']]
+# The WNN graph can be accessed at bm[["wknn"]], 
+# and the SNN graph used for clustering at bm[["wsnn"]]
+# Cell-specific modality weights can be accessed at bm$RNA.weight
+
+DefaultAssay(CD8_Tcells) <- 'SCT'
+
+CD8_Tcells <- FindMultiModalNeighbors(
+  CD8_Tcells, reduction.list = list("pca", "apca"), 
+  dims.list = list(1:40, 1:40)
+)
+
+## modality.weight.name = "RNA.weight" was removed from above and code ran. 
+CD8_Tcells <- RunUMAP(CD8_Tcells,nn.name = "weighted.nn", reduction.name = "wnn.umap3", reduction.key = "wnnUMAP3_")
+CD8_Tcells <- FindClusters(CD8_Tcells, graph.name = "wsnn", algorithm = 3, resolution = 0.4, verbose = FALSE)
+CD8_Tcells
+
+## View UMAP
+DimPlot(CD8_Tcells, reduction = 'wnn.umap3', label = TRUE, repel = TRUE, label.size = 4)
+
+CD8_Tcells <- FindNeighbors(CD8_Tcells, graph.name = "test", dims = 1:100)
+
+##save the CD8_Tcells file
+saveRDS(CD8_Tcells, file = ".rds")
+
+##read in file if needed
+CD8_Tcells <- readRDS(".rds")
+
+##Look at features of intrest 
+FeaturePlot(CD8_Tcells, features = c(), reduction = 'wnn.umap3', min.cutoff = "q10", max.cutoff = "q95", cols = c("lightgrey","darkgreen"), ncol = 2)
+geneSets <- c("Lag3", "Gzmb", "Ifng", "Foxp3", "Cs", "Cd8a", "Cd44", "Sell", "Tcf7", "Tbx21", "Eomes", "Bcl6", "Id2", "Id3", "Stat3", "Stat4", "Prdm1", "Slamf6", "Cd27", "Ccr7", "Cx3cr1", "Klrg1", "Il7r", "Il2ra", "Tox", "Pdcd1", "Prf1", "Gzmb", "Ifng", "Tnf", "Acly", "Acss2", "Ldha", "Cpt1a", "Mpc1", "Mpc2", "Cs", "Slc25a1", "Acss1", "Hk2")
+geneSets <- c("adt_CD279-(PD-1)-RMP1-30","adt_F4-80-BM8","adt_NK-1.1-PK136","adt_CD127-(IL-7Ralpha)-A7R34", "adt_TCR-gamma-Delta-GL3", "adt_CD45.2-104", "adt_CD8b-(Ly-3)-YTS156.7.7", "adt_CD223-(LAG-3)-C9B7W", "adt_CD366-(Tim-3)-RMT3-23", "adt_Mouse-IgG1-kappa-isotype-Ctrl-MOPC-21", "adt_human-KLRG1-(MAFA)-2F1-KLRG1", "adt_CD127-(IL-7Ralpha)-A7R34", "adt_CD279-(PD-1)-RMP1-30","adt_F4-80-BM8","adt_NK-1.1-PK136","adt_CD127-(IL-7Ralpha)-A7R34")
+geneSets <- c("adt_CD366-(Tim-3)-RMT3-23")
+plot_density(CD8_Tcells, c("Il7r"), joint = TRUE)
+
+
+FeaturePlot(CD8_Tcells, c("adt_CD366-(Tim-3)-RMT3-23"),  min.cutoff = "q20", max.cutoff = "q95", cols = c("lightgrey","darkgreen"))
+plot_density(CD8_Tcells, c("adt_CD366-(Tim-3)-RMT3-23"),  min.cutoff = "q20", max.cutoff = "q95", cols = c("lightgrey","darkgreen"))
+
+## This is used to plot many markers of interest and save them. 
+for (geneSet in geneSets){
+  plot0 <- FeaturePlot(CD8_Tcells,features = geneSet, reduction = 'wnn.umap3', min.cutoff = "q20", max.cutoff = "q95", cols = c("lightgrey","darkgreen"), ncol = 1)
+  plot0
+  ggsave(file=paste0("/data/home/brandon.oswald/cd8_rna//",geneSet,"feature_plot_cd8.pdf"), dpi = 600, width = 6, height = 6)
+}
+
+##Find % of cell in group
+# How many cells are in each cluster
+table(Idents(pbmc_exp2))
+table(pbmc_exp2$diet)
+
+# What proportion of cells are in each cluster?
+prop.table(table(Idents(CD8_Tcells)))
+
+# How does cluster membership vary by replicate?
+table(Idents(CD8_Tcells), CD8_Tcells$diet)
+
+# What proportion of cells are in each cluster by diet
+cellsbydiet <-prop.table(table(Idents(CD8_Tcells), CD8_Tcells$diet), margin = 2)
+cellsbydiet
+
+# Determine what the clusters are
+DefaultAssay(CD8_Tcells) <- 'SCT'
+DefaultAssay(CD8_Tcells) <- 'ADT'
+plot_density(CD8_Tcells, c("sct_Tox"), joint = TRUE)
+plot_density(CD8_Tcells, c("sct_Pdcd1", "sct_Tox"), joint = TRUE)
+ggsave(file="/data/home/brandon.oswald/stack.pdf")
+plot_density(CD8_Tcells, "Gzmb", reduction = "wnn.umap3")
+
+
+# Make plots of specfic genes of interest
+RidgePlot(pbmc_exp2, features = pbmc_exp2$seurat_clusters[3], ncol = 2)
+## Features for exhaustion 
+features <- c("sct_Tox", "sct_Havcr2", "sct_Slamf6", "sct_Tcf7", "sct_Cd69", "sct_Tbx21")
+features <- c("adt_CD279-(PD-1)-RMP1-30", "adt_CD223-(LAG-3)-C9B7W", "adt_CD366-(Tim-3)-RMT3-23", "CD69-H1.2F3")
+features <- c("Ccr7", "Sell", "Cx3cr1", "Cd27", "Il7r", "Id2", "Stat4", "Tbx21", "Eomes", "Tcf7", "Ifng","Gzmb","Stat3", "Id3", "Cd69", "Itgae", "Itga1", "Klrg1", "Prdm1")
+DotPlot(CD8_Tcells, features = features, idents = head(unique(pbmc_exp2@meta.data$seurat_clusters), 12)) + RotatedAxis()
+ggsave(file="/data/home/brandon.oswald/dotplotexhpanel.pdf", dpi = 600, width = 6, height = 6)
+RidgePlot(CD8_Tcells, features = "Sell", ncol = 2)
+
+
+##Find all ADTs and gene expression levels 
+CD8_Tcells.markers <- FindAllMarkers(CD8_Tcells, only.pos = TRUE, min.pct = 0.15, logfc.threshold = 0.15)
+CD8_Tcells.markers
+CD8_Tcells.sct <- FindAllMarkers(CD8_Tcells, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25, assay = "SCT")
+CD8_Tcells.sct
+CD8_Tcells.sct[CD8_Tcells.sct$cluster == '6',]$gene
+
+# All ADts in the assay put into a vector 
+geneSets <- c("adt_CD4-RM4-5", "adt_CD8a-53-6.7", "adt_CD366-(Tim-3)-RMT3-23", "adt_CD279-(PD-1)-RMP1-30", "adt_Ly-6C-HK1.4", "adt_human-CD11b-M1-70", "adt_Ly-6G-1A8", "adt_anti-human-mouse-CD49f-GoH3", "adt_human-CD44-IM7", "adt_CD54-YN1-1.7.4", "adt_CD90.2-30-H12", "adt_CD73-TY-11.8", "adt_CD49d-R1-2", "adt_CD200-(OX2)-OX-90", "adt_Mouse-IgG1-kappa-isotype-Ctrl-MOPC-21", "adt_Mouse-IgG2a-kappa-isotype-Ctrl-MOPC-173", "adt_CD19-6D5", "adt_Rat-IgG2b-kappa-Isotype-Ctrl-RTK4530", "adt_CD45-30-F11", "adt_CD25-PC61", "adt_human-CD45R-B220-RA3-6B2", "adt_CD115-(CSF-1R)-AFS98", "adt_CD11c-N418", "adt_CD21-CD35-(CR2-CR1)-7E9", "adt_CD23-B3B4", "adt_CD43-S11", "adt_CD5-53-7.3", "adt_CD62L-MEL-14", "adt_CD93-(AA4.1-early-B-lineage)-AA4.1", "adt_F4-80-BM8", "adt_F+B41RI+A105-MAR-1", "adt_I-A-I-E-M5-114.15.2", "adt_NK-1.1-PK136", "adt_Siglec-H-551", "adt_TCR-beta-chain-H57-597", "adt_TCR-gamma-Delta-GL3", "adt_TER-119-Erythroid-Cells-TER-119", "adt_Ly-6A-E-(Sca-1)-D7", "adt_CD45.2-104", "adt_anti-human-mouse-rat-CD278-(ICOS)-C398.4A", "adt_CD3-17A2", "adt_CD274-(B7-H1-PD-L1)-MIH6", "adt_rat-human-CD27-LG.3A10", "adt_CD20-SA275A11", "adt_CD357-(GITR)-DTA-1", "adt_CD137-17B5", "adt_CD134-(OX-40)-OX-86", "adt_CD69-H1.2F3", "adt_CD127-(IL-7Ralpha)-A7R34", "adt_CD86-GL-1", "adt_CD103-2E7", "adt_CD150-(SLAM)-TC15-12F12.2", "adt_CD24-M1-69", "adt_anti-human-mouse-integrin-beta-7-FIB504", "adt_CD106-429-(MVCAM.A)", "adt_CD183-(CXCR3)-CXCR3-173", "adt_CD8b-(Ly-3)-YTS156.7.7", "adt_TCR-Vbeta8.1-8.2-KJ16-133.18", "adt_0236-Rat-IgG1-kappa-isotype-Ctrl-RTK2071", "adt_0237-Rat-IgG1-lambda-Isotype-Ctrl-G0114F7", "adt_0238-Rat-IgG2a-kappa-Isotype-Ctrl-RTK2758", "adt_0240-Rat-IgG2c-kappa-Isotype-Ctrl-RTK4174", "adt_0241-Armenian-Hamster-IgG-Isotype-Ctrl-HTK888", "adt_human-KLRG1-(MAFA)-2F1-KLRG1", "adt_TCR-Vbeta5.1-5.2-MR9-4", "adt_CD223-(LAG-3)-C9B7W", "adt_CD163-S15049I", "adt_CD49b-HMalpha2", "adt_CD172a-(SIRPalpha)-P84", "adt_CD48-HM48-1", "adt_CD170-(Siglec-F)-S17007L", "adt_CD169-Siglec-1-3D6.112", "adt_CD71-RI7217", "adt_CD41-MWReg30", "adt_CD304-(Neuropilin-1)-3E12", "adt_CD38-90", "adt_CD55-(DAF)-RIKO-3", "adt_CD63-NVG-2", "adt_CD301b-URA-1", "adt_Tim-4-RMT4-54", "adt_rat-CD29-HMbeta1-1", "adt_IgD-11-26c.2a", "adt_CD11a-M17-4", "adt_CD200R-(OX2R)-OX-110", "adt_CCR3-(CD193)-J073E5", "adt_CD138-(Syndecan-1)-281-2", "adt_CD317-(BST2-PDCA-1)-927", "adt_CD9-MZ3", "adt_CD371-(CLEC12A)-5D3-CLEC12A", "adt_CD22-OX-97", "adt_Ly49H-3D10", "adt_Ly49D-4E5", "adt_Ly-49A-YE1-48.10.6", "adt_CD185-(CXCR5)-L138D7", "adt_CD49a-HMalpha1", "adt_CD1d-(CD1.1-Ly-38)-1B1", "adt_CD226-(DNAM-1)-10E5", "adt_CD272-(BTLA)-6A6", "adt_CD2-RM2-5", "adt_CD120b-(TNF-R-Type-II-p75)-TR75-89", "adt_CD40-3-23", "adt_CD31-390", "adt_CD107a-(LAMP-1)-1D4B", "adt_CD182-(CXCR2)-SA044G4", "adt_rat-CD61-2C9.G2-(HMbeta3-1)", "adt_VISTA-(PD-1H)-MIH63", "adt_CD186-(CXCR6)-SA051D1", "adt_Ly108-330-AJ", "adt_TCR-Valpha2-B20.1", "adt_TCR-Valpha8.3-KT50", "adt_TCR-gamma-delta-UC7-13D5", "adt_CD98-(4F2)-RL388", "adt_CD160-7H1", "adt_CD51-RMV-7", "adt_CD94-18d3", "adt_CD205-(DEC-205)-NLDC-145", "adt_CD155-(PVR)-TX56", "adt_CD88-(C5aR)-20-70", "adt_FR4-(Folate-Receptor-4)-TH6", "adt_CD45RB-C363-16A")
+
+for (geneSet in geneSets){
+  plot0 <- FeaturePlot(act_CD8_Tcells,features = geneSet, reduction = 'wnn.umap4', min.cutoff = "q20", max.cutoff = "q99", cols = c("lightgrey","darkgreen"), ncol = 1)
+  plot0
+  ggsave(file=paste0("/data/home/brandon.oswald/act_cd8_naming/adts/",geneSet,"feature_plot.pdf"), dpi = 600, width = 6, height = 6)
+}
+
+
+#Teff
+features <- c("sct_Klrg1", "sct_Ccr2", "sct_Ly6c2", "sct_S100a10", "sct_Cd7", "sct_Gzmb", "sct_Cd160", "sct_Rgs1")
+#Tem
+features <- c("sct_Hbb-bs", "sct_Klrb1c", "sct_Kcnj8", "sct_Arl4c", "sct_Klrd1") 
+#Tmem
+features <- c("sct_Il7r", "sct_Sidt1", "sct_Gpr183", "sct_Gzmm", "sct_Emb")
+#Naive
+features <- c("sct_Ccr7", "sct_Sell", "sct_Dapl1", "sct_Lef1", "sct_Igfbp4", "sct_Rps20")
+
+
+DimPlot(pbmc_removed_clusters, reduction = "wnn.umap2", label = TRUE)
+FeaturePlot(pbmc_removed_clusters, reduction = 'wnn.umap2', features = "sct_Ifng", split.by = 'diet', min.cutoff = "q15", max.cutoff = "q99")
+FeaturePlot(CD8_Tcells, reduction = 'wnn.umap3', features = "sct_", split.by = 'diet', min.cutoff = "q05", max.cutoff = "q99")
+
+#markers differetnial gene expression CD8 T cells only
+cluster1.markers <- FindMarkers(CD8_Tcells, ident.1 = "01_Ad_libitum", ident.2 = "4_Caloric_Restriction", min.pct = 0.001)
+FindMarkers(pbmc_exp2, ident.1 = "1", min.pct = 0.001)
+
+
+
+###
+###Sub clustering activated CD8 T cells form the sub clustered group. These will be (1, 4, 7, 0)
+#subcuster 1,4, 7, 0 
+DimPlot(CD8_Tcells, reduction = "wnn.umap3", label = TRUE)
+CD8_Tcells$seurat_clusters
+act_CD8_Tcells3 <- subset(CD8_Tcells, idents = c("1", "4", "7", "0"))
+act_CD8_Tcells
+
+## Sort out low nCount, low RNA, and keep only singlets with mito percentage less than 20%
+table(act_CD8_Tcells$HTO_classification)
+table(act_CD8_Tcells$orig.ident)
+
+## SCT Transform RNA data
+DefaultAssay(act_CD8_Tcells) <- 'RNA'
+act_CD8_Tcells2 <-DietSeurat(act_CD8_Tcells, assays = c("RNA","ADT"))
+act_CD8_Tcells2
+DefaultAssay(CD8_Tcells2) <- 'RNA'
+act_CD8_Tcells2 <- SCTransform(act_CD8_Tcells2, method = "glmGamPoi", vars.to.regress = "percent.mt", verbose = FALSE)
+SCTransform()
+
+## Set SCT as default assay for future analysis and create pca plot
+DefaultAssay(act_CD8_Tcells) <- 'SCT'
+act_CD8_Tcells <- FindVariableFeatures(act_CD8_Tcells2)
+act_CD8_Tcells <- ScaleData(act_CD8_Tcells) ##Did not run after SCT Transform
+act_CD8_Tcells <- RunPCA(act_CD8_Tcells, reduction.name = "pca", dims = 1:40, verbose = FALSE)
+act_CD8_Tcells
+
+DefaultAssay(act_CD8_Tcells) <- 'ADT'
+# we will use all ADT features for dimensional reduction
+# we set a dimensional reduction name to avoid overwriting the 
+VariableFeatures(act_CD8_Tcells) <- rownames(act_CD8_Tcells[["ADT"]])
+act_CD8_Tcells <- NormalizeData(act_CD8_Tcells, normalization.method = 'CLR', margin = 2) 
+act_CD8_Tcells <- ScaleData(act_CD8_Tcells)
+act_CD8_Tcells <- RunPCA(act_CD8_Tcells, reduction.name = 'apca', reduction.key = 'apca_', dims = 1:40, verbose = FALSE)
+act_CD8_Tcells
+# Identify multimodal neighbors. These will be stored in the neighbors slot, 
+# and can be accessed using bm[['weighted.nn']]
+# The WNN graph can be accessed at bm[["wknn"]], 
+# and the SNN graph used for clustering at bm[["wsnn"]]
+# Cell-specific modality weights can be accessed at bm$RNA.weight
+
+DefaultAssay(act_CD8_Tcells) <- 'SCT'
+
+act_CD8_Tcells <- FindMultiModalNeighbors(
+  act_CD8_Tcells, reduction.list = list("pca", "apca"), 
+  dims.list = list(1:40, 1:40)
+)
+
+## modality.weight.name = "RNA.weight" was removed from above and code ran. 
+act_CD8_Tcells <- RunUMAP(act_CD8_Tcells,nn.name = "weighted.nn", reduction.name = "wnn.umap4", reduction.key = "wnnUMAP4_")
+act_CD8_Tcells <- FindClusters(act_CD8_Tcells, graph.name = "wsnn", algorithm = 3, resolution = 0.4, verbose = FALSE)
+act_CD8_Tcells
+
+## View UMAP
+DimPlot(act_CD8_Tcells, reduction = 'wnn.umap4', label = TRUE, repel = TRUE, label.size = 4)
+act_CD8_Tcells <- FindNeighbors(act_CD8_Tcells, graph.name = "test", dims = 1:40)
+saveRDS(act_CD8_Tcells, file = "/data/home/brandon.oswald/filtered_cite_seq_activated_cd8_only_ALvsCR.rds")
+act_CD8_Tcells <- readRDS("/data/home/brandon.oswald/rds_files/filtered_cite_seq_activated_cd8_only_ALvsCR.rds")
+
+##Start looking at features of interest 
+FeaturePlot(act_CD8_Tcells, features = c("Tox"), reduction = 'wnn.umap4', min.cutoff = "q10", max.cutoff = "q95", cols = c("lightgrey","darkgreen"), ncol = 2, split.by = "diet")
+geneSets <- c("Lag3", "Gzmb", "Ifng", "Foxp3", "Cs", "Cd8a", "Cd44", "Sell", "Tcf7", "Tbx21", "Eomes", "Bcl6", "Id2", "Id3", "Stat3", "Stat4", "Prdm1", "Slamf6", "Cd27", "Ccr7", "Cx3cr1", "Klrg1", "Il7r", "Il2ra", "Tox", "Pdcd1", "Prf1", "Gzmb", "Ifng", "Tnf", "Acly", "Acss2", "Ldha", "Cpt1a", "Mpc1", "Mpc2", "Cs", "Slc25a1", "Acss1", "Hk2")
+geneSets <- c("adt_CD279-(PD-1)-RMP1-30","adt_F4-80-BM8","adt_NK-1.1-PK136","adt_CD127-(IL-7Ralpha)-A7R34", "adt_TCR-gamma-Delta-GL3", "adt_CD45.2-104", "adt_CD8b-(Ly-3)-YTS156.7.7", "adt_CD223-(LAG-3)-C9B7W", "adt_CD366-(Tim-3)-RMT3-23", "adt_Mouse-IgG1-kappa-isotype-Ctrl-MOPC-21", "adt_human-KLRG1-(MAFA)-2F1-KLRG1", "adt_CD127-(IL-7Ralpha)-A7R34", "adt_CD279-(PD-1)-RMP1-30","adt_F4-80-BM8","adt_NK-1.1-PK136","adt_CD127-(IL-7Ralpha)-A7R34")
+
+## This is used to plot many markers of interest and save them. 
+for (geneSet in geneSets){
+  plot0 <- FeaturePlot(act_CD8_Tcells,features = geneSet, reduction = 'wnn.umap4', min.cutoff = "q20", max.cutoff = "q95", cols = c("lightgrey","darkgreen"), ncol = 1)
+  plot0
+  ggsave(file=paste0("/data/home/brandon.oswald/act_cd8_RNA//",geneSet,"feature_plot_act_cd8.pdf"), dpi = 600, width = 6, height = 6)
+}
+
+##Find % of cell in group
+# How many cells are in each cluster
+table(Idents(act_CD8_Tcells))
+table(act_CD8_Tcells$diet)
+
+# What proportion of cells are in each cluster?
+prop.table(table(Idents(act_CD8_Tcells)))
+
+# How does cluster membership vary by replicate?
+table(Idents(act_CD8_Tcells), act_CD8_Tcells$diet)
+
+# What proportion of cells are in each cluster by diet
+cellsbydiet <-prop.table(table(Idents(act_CD8_Tcells), act_CD8_Tcells$diet), margin = 2)
+cellsbydiet
+
+# Determine what the clusters are
+DefaultAssay(act_CD8_Tcells) <- 'SCT'
+DefaultAssay(act_CD8_Tcells) <- 'ADT'
+plot_density(act_CD8_Tcells, c("sct_Tox"), joint = TRUE)
+plot_density(act_CD8_Tcells, c("sct_Pdcd1", "sct_Tox"), joint = TRUE)
+
+##Find all ADTs and gene expression levels 
+CD8_Tcells.markers <- FindAllMarkers(act_CD8_Tcells, only.pos = TRUE, min.pct = 0.15, logfc.threshold = 0.15)
+CD8_Tcells.markers
+CD8_Tcells.sct <- FindAllMarkers(act_CD8_Tcells, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25, assay = "SCT")
+
+##Visualize umaps for act_CD8_Tcells
+DimPlot(act_CD8_Tcells, reduction = "wnn.umap4", label = T, split.by = 'diet') 
+DimPlot(pbmc_removed_clusters, reduction = "wnn.umap2", label = T) 
+table(Idents(act_CD8_Tcells), act_CD8_Tcells$diet)
+
+##Find all ADTs and gene expression levels 
+CD8_Tcells.markers <- FindAllMarkers(act_CD8_Tcells, only.pos = TRUE, min.pct = 0.15, logfc.threshold = 0.15)
+CD8_Tcells.markers
+CD8_Tcells.sct <- FindAllMarkers(CD8_Tcells, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25, assay = "SCT")
+CD8_Tcells.sct
+CD8_Tcells.sct[CD8_Tcells.sct$cluster == '6',]$gene
+CD8_Tcells.markers[CD8_Tcells.markers$cluster == '4',]$gene
+
+## Nebulosa 
+plot_density(act_CD8_Tcells, features)
+Texpro1 <- plot_density(act_CD8_Tcells, c("sct_Tcf7", "sct_Myb", "sct_Il7r", "sct_Cxcr5", "sct_Icos", "sct_Cd28", "sct_Irf7", "sct_Oas1a", "sct_Stat1", "sct_Apobec3"))
+Texpro2 <- plot_density(act_CD8_Tcells, c("Mki67", "Anxa2", "Itgb7", "Alcam"))
+Texint <- plot_density(act_CD8_Tcells, c("sct_Gzmb", "sct_Gzma", "sct_Prf1", "sct_Klrg1", "sct_Cx3cr1", "sct_Tbx21", "sct_Zeb2", "sct_Id2", "sct_Prdm1", "sct_Klrd1", "sct_Klrg1", "sct_Klrk1"))
+texterm <- plot_density(act_CD8_Tcells, c("sct_Pdcd1", "sct_Lag3", "sct_Tigit", "sct_Entpd1", "sct_Cd101", "sct_Cd38", "sct_Zap70", "sct_Nfatc1", "sct_Tox", "sct_Runx3", "sct_Jak3"))
+plot_density(act_CD8_Tcells, c("Tnf"))
+FeaturePlot(act_CD8_Tcells, c("Cx3cr1"), min.cutoff = "q10", max.cutoff = "q99")
+
+# All ADTs
+geneSets <- c("adt_CD4-RM4-5", "adt_CD8a-53-6.7", "adt_CD366-(Tim-3)-RMT3-23", "adt_CD279-(PD-1)-RMP1-30", "adt_Ly-6C-HK1.4", "adt_human-CD11b-M1-70", "adt_Ly-6G-1A8", "adt_anti-human-mouse-CD49f-GoH3", "adt_human-CD44-IM7", "adt_CD54-YN1-1.7.4", "adt_CD90.2-30-H12", "adt_CD73-TY-11.8", "adt_CD49d-R1-2", "adt_CD200-(OX2)-OX-90", "adt_Mouse-IgG1-kappa-isotype-Ctrl-MOPC-21", "adt_Mouse-IgG2a-kappa-isotype-Ctrl-MOPC-173", "adt_CD19-6D5", "adt_Rat-IgG2b-kappa-Isotype-Ctrl-RTK4530", "adt_CD45-30-F11", "adt_CD25-PC61", "adt_human-CD45R-B220-RA3-6B2", "adt_CD115-(CSF-1R)-AFS98", "adt_CD11c-N418", "adt_CD21-CD35-(CR2-CR1)-7E9", "adt_CD23-B3B4", "adt_CD43-S11", "adt_CD5-53-7.3", "adt_CD62L-MEL-14", "adt_CD93-(AA4.1-early-B-lineage)-AA4.1", "adt_F4-80-BM8", "adt_F+B41RI+A105-MAR-1", "adt_I-A-I-E-M5-114.15.2", "adt_NK-1.1-PK136", "adt_Siglec-H-551", "adt_TCR-beta-chain-H57-597", "adt_TCR-gamma-Delta-GL3", "adt_TER-119-Erythroid-Cells-TER-119", "adt_Ly-6A-E-(Sca-1)-D7", "adt_CD45.2-104", "adt_anti-human-mouse-rat-CD278-(ICOS)-C398.4A", "adt_CD3-17A2", "adt_CD274-(B7-H1-PD-L1)-MIH6", "adt_rat-human-CD27-LG.3A10", "adt_CD20-SA275A11", "adt_CD357-(GITR)-DTA-1", "adt_CD137-17B5", "adt_CD134-(OX-40)-OX-86", "adt_CD69-H1.2F3", "adt_CD127-(IL-7Ralpha)-A7R34", "adt_CD86-GL-1", "adt_CD103-2E7", "adt_CD150-(SLAM)-TC15-12F12.2", "adt_CD24-M1-69", "adt_anti-human-mouse-integrin-beta-7-FIB504", "adt_CD106-429-(MVCAM.A)", "adt_CD183-(CXCR3)-CXCR3-173", "adt_CD8b-(Ly-3)-YTS156.7.7", "adt_TCR-Vbeta8.1-8.2-KJ16-133.18", "adt_0236-Rat-IgG1-kappa-isotype-Ctrl-RTK2071", "adt_0237-Rat-IgG1-lambda-Isotype-Ctrl-G0114F7", "adt_0238-Rat-IgG2a-kappa-Isotype-Ctrl-RTK2758", "adt_0240-Rat-IgG2c-kappa-Isotype-Ctrl-RTK4174", "adt_0241-Armenian-Hamster-IgG-Isotype-Ctrl-HTK888", "adt_human-KLRG1-(MAFA)-2F1-KLRG1", "adt_TCR-Vbeta5.1-5.2-MR9-4", "adt_CD223-(LAG-3)-C9B7W", "adt_CD163-S15049I", "adt_CD49b-HMalpha2", "adt_CD172a-(SIRPalpha)-P84", "adt_CD48-HM48-1", "adt_CD170-(Siglec-F)-S17007L", "adt_CD169-Siglec-1-3D6.112", "adt_CD71-RI7217", "adt_CD41-MWReg30", "adt_CD304-(Neuropilin-1)-3E12", "adt_CD38-90", "adt_CD55-(DAF)-RIKO-3", "adt_CD63-NVG-2", "adt_CD301b-URA-1", "adt_Tim-4-RMT4-54", "adt_rat-CD29-HMbeta1-1", "adt_IgD-11-26c.2a", "adt_CD11a-M17-4", "adt_CD200R-(OX2R)-OX-110", "adt_CCR3-(CD193)-J073E5", "adt_CD138-(Syndecan-1)-281-2", "adt_CD317-(BST2-PDCA-1)-927", "adt_CD9-MZ3", "adt_CD371-(CLEC12A)-5D3-CLEC12A", "adt_CD22-OX-97", "adt_Ly49H-3D10", "adt_Ly49D-4E5", "adt_Ly-49A-YE1-48.10.6", "adt_CD185-(CXCR5)-L138D7", "adt_CD49a-HMalpha1", "adt_CD1d-(CD1.1-Ly-38)-1B1", "adt_CD226-(DNAM-1)-10E5", "adt_CD272-(BTLA)-6A6", "adt_CD2-RM2-5", "adt_CD120b-(TNF-R-Type-II-p75)-TR75-89", "adt_CD40-3-23", "adt_CD31-390", "adt_CD107a-(LAMP-1)-1D4B", "adt_CD182-(CXCR2)-SA044G4", "adt_rat-CD61-2C9.G2-(HMbeta3-1)", "adt_VISTA-(PD-1H)-MIH63", "adt_CD186-(CXCR6)-SA051D1", "adt_Ly108-330-AJ", "adt_TCR-Valpha2-B20.1", "adt_TCR-Valpha8.3-KT50", "adt_TCR-gamma-delta-UC7-13D5", "adt_CD98-(4F2)-RL388", "adt_CD160-7H1", "adt_CD51-RMV-7", "adt_CD94-18d3", "adt_CD205-(DEC-205)-NLDC-145", "adt_CD155-(PVR)-TX56", "adt_CD88-(C5aR)-20-70", "adt_FR4-(Folate-Receptor-4)-TH6", "adt_CD45RB-C363-16A")
+
+## All genes of Interest
+geneSets <- c("Ifit1", "Ifit3","Cd69","Irf7", "Isg15", "Runx1", "Havcr2", "Fasl", "Nfatc1", "Gfi1", "S1pr1", "Nfatc3", "Notch2", "Cd48", "Dnmt1", "Irf1", "Cd244a", "Icam2", "Tbx21", "Cdca3", "Cdca7", "Cdk1", "Cdc25b", "Itgb7", "Ccnf", "Ccna2", "Crmp1", "Ezh2", "Sell", "Slamf6", "Hif1a","Tcf7", "Cxcr5", "Zeb2", "Tbx21", "Klrc1", "Cd44", "Pdcd1", "Cd160", "Cd38", "Pclaf", "Mki67", "sct_Il7r", "Oasl1", "sct_Pdcd1", "sct_Lag3", "sct_Tigit", "sct_Entpd1", "sct_Cd101", "sct_Cd38", "sct_Zap70", "sct_Nfatc1", "sct_Tox", "sct_Runx3")
+gene_list <- c("Ifit1", "Ifit3","Cd69","Irf7", "Isg15", "Runx1", "Havcr2", "Fasl", "Nfatc1", "Gfi1", "S1pr1", "Nfatc3", "Notch2", "Cd48", "Dnmt1", "Irf1","Amigo1", "Cd244a", "Icam2", "Tbx21", "Cdca3", "Cdca7", "Cdk1", "Cdc25b", "Itgb7", "Ccnf", "Ccna2", "Crmp1", "Ezh2", "Sell", "Slamf6", "Hif1a","Tcf7", "Cxcr5", "Zeb2", "Tbx21", "Klrc1", "Cd44", "Pdcd1", "Cd160", "Cd38", "Pclaf", "Mki67", "sct_Il7r", "Oasl1", "sct_Pdcd1", "sct_Lag3", "sct_Tigit", "sct_Entpd1", "sct_Cd101", "sct_Cd38", "sct_Zap70", "sct_Nfatc1", "sct_Tox", "sct_Runx3")
+
+#FeaturePlot for genes
+for (geneSet in geneSets){
+  plot0 <- FeaturePlot(act_CD8_Tcells,features = geneSet, reduction = 'wnn.umap4', min.cutoff = "q20", max.cutoff = "q99", cols = c("lightgrey","darkgreen"), ncol = 1)
+  plot0
+  ggsave(file=paste0("/data/home/brandon.oswald/act_cd8_naming/feature_plot/",geneSet,"feature_plot.pdf"), dpi = 600, width = 6, height = 6)
+}
+
+#Plotdensity for genes
+for (geneSet in geneSets){
+  plot0 <- plot_density(act_CD8_Tcells,features = geneSet, reduction = 'wnn.umap4')
+  plot0
+  ggsave(file=paste0("/data/home/brandon.oswald/act_cd8_naming/density_plot/",geneSet,"density_plot.pdf"), dpi = 600, width = 6, height = 6)
+}
+
+#FeaturePlot for adts
+for (geneSet in geneSets){
+  plot0 <- FeaturePlot(act_CD8_Tcells,features = geneSet, reduction = 'wnn.umap4', min.cutoff = "q20", max.cutoff = "q99", cols = c("lightgrey","darkgreen"), ncol = 1)
+  plot0
+  ggsave(file=paste0("/data/home/brandon.oswald/act_cd8_naming/feature_plot/adts/",geneSet,"density_plot.pdf"), dpi = 600, width = 6, height = 6)
+}
+
+#PlotDensity for adts
+for (geneSet in geneSets){
+  plot0 <- plot_density(act_CD8_Tcells,features = geneSet, reduction = 'wnn.umap4')
+  plot0
+  ggsave(file=paste0("/data/home/brandon.oswald/act_cd8_naming/density_plot/adts/",geneSet,"density_plot.pdf"), dpi = 600, width = 6, height = 6)
+}
+
+# What proportion of cells are in each cluster by diet
+cellsbydiet <-prop.table(table(Idents(act_CD8_Tcells), act_CD8_Tcells$diet), margin = 2)
+cellsbydiet
+
+##test for KEGG pathway analysis
+DGE_2_3 <- FindMarkers(act_CD8_Tcells, ident.1 = 2, ident.2 = 3)
+DGE_0_1 <- FindMarkers(act_CD8_Tcells, ident.1 = 0, ident.2 = 1)
+DGE_0_4 <- FindMarkers(act_CD8_Tcells, ident.1 = 0, ident.2 = 4)
+DGE_1_5 <- FindMarkers(act_CD8_Tcells, ident.1 = 1, ident.2 = 5)
+DEG_0_v_all <- FindMarkers(act_CD8_Tcells, test.use = "wilcox", min.pct = 0.1, ident.1 = 0)
+DEG_1_v_all <- FindMarkers(act_CD8_Tcells, test.use = "wilcox", min.pct = 0.1, ident.1 = 1)
+DEG_2_v_all <- FindMarkers(act_CD8_Tcells, test.use = "wilcox", min.pct = 0.1, ident.1 = 2)
+DEG_3_v_all <- FindMarkers(act_CD8_Tcells, test.use = "wilcox", min.pct = 0.1, ident.1 = 3)
+DEG_4_v_all <- FindMarkers(act_CD8_Tcells, test.use = "wilcox", min.pct = 0.1, ident.1 = 4)
+DEG_5_v_all <- FindMarkers(act_CD8_Tcells, test.use = "wilcox", min.pct = 0.1, ident.1 = 5)
+DEG_6_v_all <- FindMarkers(act_CD8_Tcells, test.use = "wilcox", min.pct = 0.1, ident.1 = 6)
+DEG_7_v_all <- FindMarkers(act_CD8_Tcells, test.use = "wilcox", min.pct = 0.1, ident.1 = 7)
+
+##Volcano plots on DEGs
+DGE_2_3
+EnhancedVolcano(DGE_2_3, rownames(DGE_2_3), x ="avg_log2FC", 
+                y ="p_val_adj", FCcutoff = 1, title = "Volcano plot - cluster 0")
+EnhancedVolcano(DGE_0_4, rownames(DGE_0_4), x ="avg_log2FC", 
+                y ="p_val_adj", FCcutoff = 1, title = "Volcano plot - cluster 0 vs 4")
+EnhancedVolcano(DEG_0_v_all, rownames(DEG_0_v_all), x ="avg_log2FC", 
+                y ="p_val_adj", FCcutoff = 1, title = "Volcano plot - cluster 0 vs all")
+EnhancedVolcano(DEG_1_v_all, rownames(DEG_1_v_all), x ="avg_log2FC", 
+                y ="p_val_adj", FCcutoff = 1, title = "Volcano plot - cluster 1 vs all")
+EnhancedVolcano(DEG_2_v_all, rownames(DEG_2_v_all), x ="avg_log2FC", 
+                y ="p_val_adj", FCcutoff = 1, title = "Volcano plot - cluster 2 vs all")
+EnhancedVolcano(DEG_3_v_all, rownames(DEG_3_v_all), x ="avg_log2FC", 
+                y ="p_val_adj", FCcutoff = 1, title = "Volcano plot - cluster 3 vs all")
+EnhancedVolcano(DEG_4_v_all, rownames(DEG_4_v_all), x ="avg_log2FC", 
+                y ="p_val_adj", FCcutoff = 1, title = "Volcano plot - cluster 4 vs all")
+EnhancedVolcano(DEG_5_v_all, rownames(DEG_5_v_all), x ="avg_log2FC", 
+                y ="p_val_adj", FCcutoff = 1, title = "Volcano plot - cluster 5 vs all")
+EnhancedVolcano(DEG_6_v_all, rownames(DEG_6_v_all), x ="avg_log2FC", 
+                y ="p_val_adj", FCcutoff = 1, title = "Volcano plot - cluster 6 vs all")
+EnhancedVolcano(DEG_7_v_all, rownames(DEG_7_v_all), x ="avg_log2FC", 
+                y ="p_val_adj", FCcutoff = 1, title = "Volcano plot - cluster 7 vs all")
+ggsave(file="/data/home/brandon.oswald/act_cd8_naming/volcano_plots/cluster7vsall.pdf", dpi = 600, width = 10, height = 10)
+
+
+
+library(velocyto.R)
+library(SeuratWrappers)
+
+#FindAllMarkers function
+act_cd8_markers <- FindAllMarkers(act_CD8_Tcells, only.pos = TRUE, min.pct = 0.15, logfc.threshold = 0.15)
+
+#Change defalt assay as needed
+DefaultAssay(act_CD8_Tcells) <- 'RNA'
+act_CD8_Tcells
+
+##Make Vln Plots for cell populations
+VlnPlot(act_CD8_Tcells, assay = "ADT", features = "adt_human-CD44-IM7", split.by = "diet", idents = c("2", "3", "0", "4"))
+VlnPlot(act_CD8_Tcells,assay = "SCT", features = "sct_B4galt5", slot = "data", idents = c("0", "2", "3"), sort = TRUE, layer = "")
+VlnPlot(act_CD8_Tcells, "Cd44", alpha = 0)
+
+##assign diet to clusters (important because did not transfer over)
+##name clusters
+act_CD8_Tcells$clust.diet <- paste(Idents(act_CD8_Tcells), act_CD8_Tcells$diet, sep = "_")
+act_CD8_Tcells$clust.diet
+
+##Change Ident for Kegg Marker anayslsis between diets
+Idents(act_CD8_Tcells) <- act_CD8_Tcells$clust.diet
+Idents(act_CD8_Tcells)
+
+##Change back when needed
+Idents(act_CD8_Tcells) <- act_CD8_Tcells$seurat_clusters
+
+##Find Markers for Kegg analysis
+markers3DR <- FindMarkers(act_CD8_Tcells, ident.1 = "3_Ad_libitum", ident.2 = "3_Caloric_Restriction", assay = "SCT", slot = "scale.data")
+markers2DR <- FindMarkers(act_CD8_Tcells, ident.1 = "2_Ad_libitum", ident.2 = "2_Caloric_Restriction", assay = "SCT", slot = "scale.data")
+markers0DR <- FindMarkers(act_CD8_Tcells, ident.1 = "0_Ad_libitum", ident.2 = "0_Caloric_Restriction", assay = "SCT", slot = "scale.data")
+
+##Save differential gene expression to excell based on FindMarkers function
+markers_df <- data.frame(Gene = rownames(markers3DR), markers3DR)
+write_xlsx(markers_df, "/home/brandon.oswald/act_cd8_naming/kegg_pathway/deg_excel/cluster3alvsdr.xlsx")
+
+##Paste genes in vector format as needed
+gene_vector <- c("Trerf1", "Itga4", "Rps6ka3", "Itpr1", "Gramd3", "Tlk1", "St6galnac3", "Il21r", "Zyg11b", "Emb", "Icos", "Rora", "Fam169b", "Ppp1r16b", "Phlpp1", "Ikzf2", "Satb1", "Slc30a9", "Itpk1", "Hif1a", "Rapgef2", "Prkcb", "Glcci1", "Vps37b", "Irak2", "Oxsr1", "Dip2b", "Clcn3", "Etv6", "Usp15", "Bcl2", "Mllt3", "Gramd1b", "Stat5b", "Kmt5b", "Xrn1", "Ctla4", "mt-Nd1", "Eml4", "Malt1", "Ssh2", "Camk2d", "Bcl2l11", "Gm2682", "AI506816", "Kcnq5", "Wwox", "Fnbp1", "mt-Co3", "Tab2", "Pag1", "Ms4a4c", "Rnf169", "Med14", "Pik3ap1", "Stat3", "Prpf8", "Stat4", "Zeb1", "Srpk2", "Fam102a", "Tut4", "Ccr5", "mt-Atp6", "Hdac8", "Ablim1", "Arap2", "Mlxip", "Clasp2", "Slmap", "Ncoa1", "Ikzf1", "Jak2", "Gzmk", "mt-Co2", "Samd9l", "Thada", "Tasor2", "Runx3", "Sntb1", "Sipa1l1", "Runx1", "Sla", "Tspan5", "Sp4", "Map3k1", "Myh9", "Tnfrsf9", "Nlk", "Gnptab", "Adnp", "Gm26740", "Gzma", "Adam19", "Clasp1", "Hmgcr", "Tgfbr2", "Tmem131l", "mt-Cytb", "Pfkfb3", "Dgkd", "Arhgap26", "Mxi1", "Traf3", "Usp25", "Scaf8", "Rcor1", "Ankrd11", "Dennd4c", "Chd2", "Eif4g3", "mt-Atp8", "Atp10a", "Ankrd12", "Tnks2", "Rbm6", "Canx", "Usp9x", "Atp11b", "Rlf", "Lmbrd1", "Atp9b", "Rnf19a", "Camk4", "Ankib1", "Gm26917", "Junb", "Tbl1x", "Plcl2", "BE692007", "Fbxo11", "Card11", "mt-Nd4l", "Fars2", "Dnajc13", "A430093F15Rik", "Arhgef3", "Rab8b", "Ptk2b", "Arih1", "mt-Nd5", "Gzmb", "Lcor", "Tcf12", "Ythdf3", "Dis3l2", "Foxp1", "Msi2", "Epb41", "Ssbp3", "Ahcyl2", "Smyd1", "Akap10", "Foxo1", "Ascc3", "Itgb1", "Il10ra", "Wrn", "Ptpn12", "Rad54l2", "Rasa3", "Slc37a3", "A330023F24Rik", "Herc1", "Cdk8", "Ifngr1", "Ubr5", "Jmjd1c", "Dcaf5", "Celf2", "Ptpn22", "Pitpnc1", "Rngtt", "Cd6", "Prkch", "Airn", "Trps1", "Creb1", "Bach2", "Mllt10", "Rel", "Dgka", "Cd96", "Nfkb1", "Ranbp2", "Gm20559", "Trip12", "Slc4a7", "Atad2b", "Prrc2b", "mt-Co1", "Dennd4a", "Arid5b", "Stag2", "Dpp4", "Pvt1", "Erap1", "Lrch1", "Tnrc6a", "Mctp2", "Spata5", "Chd7", "Tet3", "Stag1", "Cd5", "Serpinb9", "Picalm", "Zup1", "Ptpn13", "Slc2a1", "Sptbn1", "Nsd3", "Tspan14", "Hdac4", "Akap13", "Atp13a3", "Lbr", "Tet2", "Tmem131", "Rsrc1", "Tcf20", "Nrf1", "Igf2r", "Celf1", "Strn", "Cnot6l", "Rbl2", "Fam172a", "Rnf213", "Rbm33", "4932438A13Rik", "Phf20l1", "Prkcq", "Akt3", "Jazf1", "Stk39", "Smg7", "Elmo1", "Ugcg", "Smg1", "Peli1", "Atf6", "Mthfd1l", "Tnrc6b", "Vps54", "Pds5b", "Abcb7", "Herc6", "Ap3b1", "Gabpb2", "Bhlhe40", "Ero1l", "Rasgrp1", "Trim30a", "Cd44")
+gene_vector <- c("Mt2", "Mt1", "C1qbp", "Npm1", "Nme1", "Eif5a", "Ncl", "Mif", "Pa2g4", "Rpl41", "Plac8", "Srm", "Hspe1", "Tg", "Tpi1", "Nolc1", "Slc7a5", "Tnfrsf4", "Hspd1", "Tnfrsf9", "Trbc1", "Emb", "Ranbp1", "Mt3", "Hsp90aa1", "Sdf4", "Ass1", "Rpl13", "H1f0", "Myc", "Ddit4", "Rps8", "Oxsr1", "Cd160", "Trerf1", "Gm10076", "Il2ra", "Rpl32", "Cdk6", "Xcl1", "AI506816", "Ctla4", "Itpr1", "Hnrnpab", "Serpinb6b", "Rpsa", "mt-Nd1", "Gzmb", "Ifitm3", "Rps20", "Junb", "Eea1", "Gapdh", "Chd7", "Dut", "Stat3", "Gm47283", "Mthfd1l", "Gm26917", "Kcnq5", "Gzma", "Atp2a2", "Nr4a2", "Slc7a1", "Picalm", "Dip2b", "mt-Atp6", "Huwe1", "Tmsb10", "Atp1a1", "Ablim1", "Il12rb2", "Serpinb9", "Rps6ka3", "Bhlhe40", "Icos", "Ctla2a", "Canx", "Eml4")
+gene_vector3DR <- c("Trerf1", "Itpr1", "Gm47283", "Il2ra", "Ksr1", "Rora", "Itpk1", "Slc7a5", "Trav8d-2", "Atp2a2", "Dock9", "Trak1", "Il12rb2", "Hyou1", "Cables1", "Mdn1", "Emb", "Ero1l", "AI506816", "Fam185a", "Tfrc", "Znrf3", "Il7r", "Slc2a1", "Ctla4", "Rptor", "Fkbp5", "Satb1", "Lef1", "Dip2b", "Ecpas", "Prpf8", "Tnfrsf9", "Rere", "A630089N07Rik", "Foxo1", "Cyp51", "Hif1a", "Ktn1", "Traf3", "Clcn3", "Lrrc8d", "Usp6nl", "Xpo4", "Lamc1", "Hmgcr", "Ranbp2", "Abl2", "Nufip2", "Pik3r5", "Pag1", "Abcb1b", "Canx", "Cdk6", "Gas2", "Slc7a1", "Dusp16", "Nr6a1", "Dclk1", "Slco3a1", "Usp24", "Celf1", "Csnk1g1", "Tasor2", "Calr", "Itgb7", "Snd1", "Tm9sf3", "Gramd3", "Slc4a7", "Gm26917", "Ccdc88c", "Trbv12-1", "Atad5", "Huwe1", "Adk", "Ints6", "Myo10", "Agtpbp1", "Zfp609", "Ralgapb", "Trpm6", "Spata5", "R3hdm1", "Hspd1", "Abcc4", "Tmem245", "Gm20400", "Zyg11b", "Etv6", "Plxnc1", "Bcl2", "Atrn", "Atp1a1", "Pvt1", "Arid2", "Arhgef9", "Ppp1r16b", "Synpo2", "Arih1", "Wwox", "Nolc1", "Epha3", "Tgfbr3", "Atp9b", "Plch1", "Tex2", "Fndc3a", "Cd44", "Tcf20", "Sgms1", "Phc3", "Runx3", "Camk4", "2210408I21Rik", "Tab2", "Tmem87a", "Rrbp1", "Tg", "mt-Atp6", "Icos", "Cyth1", "Spidr", "Stard13", "Asxl2", "Gprin3", "Stat3", "Tiam1", "Ppp2r3a", "Usp37", "Tspan5", "Tet2", "Arhgap26", "Lcor", "Fam120c", "Ahcyl2", "Rnf157", "Ern1", "Tnks", "Gzmb", "Pdss2", "Galnt7", "Erap1", "Pkp4", "Rreb1", "Chd7", "Nptn", "Phlpp1", "Rnf43", "Acsl4", "Kcnq5", "Atp11b", "Col4a3bp", "Cmip", "Slc37a3", "Serpinb9", "Nck2", "Tnrc6a", "Trbj1-1", "Hivep1", "Nrf1", "Igf1r", "Slc2a3", "Arhgap35", "Tm9sf2", "Adnp", "Usp15", "Atp13a3", "Lmbrd1", "mt-Nd6", "Bcl2l1", "Slmap", "Nfkb1", "Tspan14", "Zzef1", "Crtam", "Kcnip1", "Vps13a", "Lcorl", "Ankib1", "Bmp2k", "Rps6ka3", "Ccr7", "Pik3ca", "Rfx7", "Rnf19a", "Gnptab", "Stat5b", "Slc30a9", "Tnfrsf4", "Wdpcp", "Rai1", "Rock2", "Hnrnpab", "Phtf2", "Sipa1l3", "Bhlhe40", "Pds5a", "Gcnt1", "Lrrc28", "Gramd1b", "Fhit", "Eif5a", "Parp8", "Rad54l2", "Zmym4", "Bmt2", "Acoxl", "Erbin", "Zfp638", "Tbl1xr1", "Tsc22d2", "Rcor1", "Tgfbr2", "Ascc3", "Gm35330", "Gm49890", "Zmym2", "Serpinb6b", "Il6st", "Ddit4", "Cdk13", "Gpr183", "Cnnm2", "Fars2", "Sos2", "Tshz2", "1700012I11Rik", "Gm47015", "Pign", "Atad2", "mt-Nd1", "Tmem131", "Iqgap2", "Mt1", "Trav4-4-dv10", "Itgb1", "Ttll5", "Ttc39c", "Tnks2", "Mbnl3", "Smad3", "Eif4g3", "Sacs", "St6gal1", "Dync1h1", "Nf1", "Nfatc2", "Sema7a", "Stxbp5", "Ifnar1", "Maml3", "Lhfpl2", "Mgat5", "Nlk", "Rictor", "Slc24a3", "Tbck", "Ash1l", "Hdac4", "Lcp1", "Zzz3", "Nfat5", "Npm1", "Raf1", "Ptch1", "Ncoa1", "Smg7", "Trbv13-1", "Trps1", "Malt1", "Ankle2", "Ssh2", "Heg1", "Dennd4a", "Mctp2", "Trbv13-2", "Ndnf", "Trpm7", "2010016I18Rik", "Dgka", "Etnk1", "Gm26756", "Btla", "Cdk8", "Mthfd1l", "Serpine2", "Otud7b", "Trav14d-3-dv8", "Icam1", "Lmtk2", "Ptprj", "Hspa5", "Sik3", "Tnip3", "Ncl", "Ablim1", "Irf4", "Arhgap39", "Zfp148", "Fam102a", "Ptpn22", "Smg1", "Plcxd2", "Fam117a", "Rapgef2", "Dennd4c", "Prdm1", "Svil", "R3hcc1l", "Ralgapa1", "Ly75", "Ythdf3", "Trav19", "Znrf1", "Tespa1", "Trbv20", "Trbv24", "Ttc17", "Zswim6", "Ar", "Gabpb2", "Chd2", "Myo5a", "Eml4", "Nxpe3", "Uvrag", "Sesn3", "Ptpn4", "Fam193a", "Reps1", "Egr3", "Mxd1", "Cd160", "Tshz3", "Herc4", "Lrch1", "Oxsr1", "Gphn", "Ccdc148", "Cwc27", "Tet3", "Akap13", "2610035D17Rik", "Dpp4", "Vps37b", "Xcl1", "Trav1", "Myc", "Sdf4", "Syt14", "Itgax", "Smyd1", "Trbv19", "Ccr8", "Nr4a3", "Trav7-3", "Srm", "Hsph1", "Ext1", "Nr4a1", "Myh9", "Vegfa", "Ranbp1", "Runx2", "Mt2", "Mt3", "Ms4a4c", "mt-Co2", "Itm2a", "Dut", "Plxdc2", "mt-Atp8")
+gene_vector2DR <- c("Trerf1", "St6gal1", "Itga4", "Rps6ka3", "Itpr1", "Trav8d-2", "2610035D17Rik", "Plcxd2", "Gramd3", "Tlk1", "Aff3", "Epha3", "Fhit", "St6galnac3", "Il21r", "Rundc3b", "Zyg11b", "Emb", "Trbv13-1", "Sesn3", "Trav1", "Icos", "Rora", "Fam169b", "Pecam1", "Ppp1r16b", "Btla", "Phlpp1", "Ikzf2", "Satb1", "Slc30a9", "Itpk1", "Ccr7", "Hif1a", "Rapgef2", "Asap1", "Adk", "Prkcb", "Glcci1", "Vps37b", "Slamf6", "Irak2", "Trbv15", "Oxsr1", "Dip2b", "Bcl2l1", "Clcn3", "Etv6", "Usp15", "Bcl2", "Pde4b", "Mllt3", "Itgb7", "Gramd1b", "Stat5b", "Kmt5b", "Xrn1", "Ctla4", "mt-Nd1", "Nf1", "Tanc1", "Eml4", "Malt1", "Nck2", "Ssh2", "Gm20732", "Camk2d", "Bcl2l11", "Ggta1", "Smad3", "Gm2682", "AI506816", "Kcnq5", "Il7r", "Wwox", "Fnbp1", "mt-Co3", "Tab2", "Eya2", "Atp2a3", "Rap1gap2", "Pag1", "Fkbp5", "Ms4a4c", "Dock9", "Rnf43", "Rnf169", "Ar", "Med14", "Pik3ap1", "Lrrc8d", "Stat3", "Prpf8", "Stat4", "Mtss1", "Zeb1", "Srpk2", "Fam102a", "Tut4", "Ccr5", "Mgat5", "mt-Atp6", "Hdac8", "Ablim1", "Arap2", "Mlxip", "Pdcd4", "Clasp2", "Gm43329", "Slmap", "Ncoa1", "Ikzf1", "Jak2", "Gzmk", "mt-Co2", "Tmem241", "Cables1", "Gm49180", "Samd9l", "Thada", "Tasor2", "Gpr183", "Runx3", "Sntb1", "Sipa1l1", "Runx1", "Sla", "Tspan5", "Sp4", "Map3k1", "Trbv20", "Spred2", "Myh9", "Ifit1bl1", "Il2ra", "Tnfrsf9", "Nlk", "Gnptab", "Adnp", "Gm26740", "Gzma", "Gm30373", "Tespa1", "Slc24a3", "Adam19", "Clasp1", "Slco3a1", "Hmgcr", "Abcb1b", "Tgfbr2", "Tmem131l", "mt-Cytb", "Pfkfb3", "Dgkd", "Arhgap26", "Gpr55", "Ssbp2", "Tcf7", "Pkp4", "Lef1", "Sgms1", "Mxi1", "Traf3", "Scfd2", "Tg", "Mxd1", "Usp25", "Gm12216", "A930007I19Rik", "Znrf3", "Pde11a", "Gm47283", "Scaf8", "Tox2", "Ankrd11", "Dennd4c", "Spata6", "Chd2", "Eif4g3", "mt-Atp8", "Atp10a", "Ankrd12", "Usp6nl", "Tnks2", "Rbm6", "Atad5", "Canx", "4930417O13Rik", "Usp9x", "Cep128", "Arhgap24", "Atp11b", "Rlf", "Lmbrd1", "Trbv24", "Ktn1", "Atp9b", "Zmym4", "Rnf19a", "Camk4", "Myo1e", "Sidt1", "Kdm5b", "Ankib1", "Gm26917", "Junb", "Ifngas1", "Plcl2", "Gas2", "BE692007", "Fbxo11", "Card11", "mt-Nd4l", "2210408I21Rik", "Cd160", "Ankrd6", "Fars2", "E130308A19Rik", "Lilr4b", "Dnajc13", "Ksr1", "A430093F15Rik", "Rab8b", "Rev3l", "Arih1", "mt-Nd5", "Gm20400", "Gzmb", "Lcor", "Tcf12", "Dock5", "Foxp1", "Cwc27", "Klhl3", "Ssbp3", "Ahcyl2", "Smyd1", "Ralyl", "Tnfsf8", "Il10ra", "Wrn", "Spidr", "Rad54l2", "Trbj1-1", "Pou2f1", "Gucy1a1", "Heg1", "Cdk8", "Ifngr1", "Celf2", "Ptpn22", "Slc7a1", "Pitpnc1", "Ifit2", "Prkch", "Trav3-1", "Rel", "H1f0", "Arhgap35", "Cd79a", "Ptbp2", "mt-Co1", "Dennd4a", "mt-Nd6", "Trav4-4-dv10", "Tha1", "Tgfbr3", "Trav5-1", "St7", "Gm42047", "Maml3", "Tcrg-C4", "Trdv1", "Impg2", "Myc", "Gadd45g", "Gm30211", "Trav12-2", "Rtp4", "Rad51b", "Trav14d-3-dv8", "Neb", "Prrg1", "Prim2", "Trbv16", "Pard3b", "Ncapg2", "Neil3", "Kpna2", "Tff1")
+gene_vector3AL <- c("Dapl1", "Mbnl1", "Sdcbp2", "Trav8d-1", "Ccl4", "Hspb1", "Egr2", "Fmn1", "4930452B06Rik", "Stat1", "Trav7-4", "Itgav", "Ago4", "Prkch", "Hip1", "Gm37963", "Traj39", "Id2", "Trav9-2", "Gm42418", "Trav16n", "6530403H02Rik", "Ncr1", "Gm15494", "S100a4", "Sub1", "Baz1a", "Trav12-3", "Tmsb10", "Cnih2", "Glp1r", "Ifi214", "Ipcef1", "Ifng", "Utrn", "Pglyrp1", "Rps20", "H2-Aa", "Spp1", "Ltb", "Ccl8", "Nlrc5", "Gvin1", "Serinc3", "Tbc1d5", "Gfod1", "Samd3", "Gm10076", "Stmn1", "2900026A02Rik", "Atxn1", "Disc1", "Klre1", "Rbpj", "Epsti1", "Ankrd12", "Xdh", "Lims1", "Trav13-2", "Grik4", "Rasa1", "Atf7ip", "St8sia4", "S100a11", "Slc22a15", "Itpr2", "Cdkl5", "Setbp1", "Klrc2", "Aak1", "Hmgb2", "Trav8-1", "Arl6ip1", "Abr", "Ccl5", "Supt3", "Kif20b", "Tle4", "Fut8", "Cd247", "S100a6", "Trim14", "Rpl32", "Spag9", "Crip1", "Sytl2", "Wls", "Cdk14", "Ms4a4b", "Diaph3", "Mef2a", "Nedd9", "Uba52", "Cacna1d", "Ifi27l2a", "Rps15a", "Itga1", "Dock2", "Nrp1", "Jun", "Foxn3", "Cd200r1", "H2-K1", "Atp2b2", "Lag3", "Sorl1", "Btbd11", "Neil3", "Kansl1l", "Tmsb4x", "Runx1", "Exoc4", "Fau", "Kif11", "Arhgap15", "Gbp6", "Klrd1", "Slc28a2", "Entpd1", "Lgals1", "Ugt1a10", "Skap1", "Tox", "Rps24", "Xist", "S100a10", "Cxcr6", "Klrc1", "Trav14-1", "Ptprk", "Ubash3b", "Adamts6", "Slc16a10", "Vav3", "Dgkh", "Trav17", "Specc1", "Ly6a", "Shisa5", "Ppm1h", "AW112010", "Slc9a9", "Cd52", "Srgap3", "Prkca", "Cd3g", "Ly6c2", "Rabgap1l", "Fosb", "Lyst", "Malat1", "Bard1", "Nkg7", "Ulbp1", "Trbv2", "Ank3", "Zbtb20", "Fry", "Chn2", "Gm36723", "Jazf1", "Dnah8", "Trbv29", "Gm49980")
+
+
+##Convert to Entrezid IDs from symbols
+New_list <- mapIds(org.Mm.eg.db, gene_vector3AL, 'ENTREZID', 'SYMBOL')
+New_list
+
+##list of Entrezid IDs to be used with Kegg as needed
+gene_numbers_vector <- c("224829", "16401", "110651", "16438", "107022", "228012", "20447", "60504", "414872", "13723", "54167", "19883", "434197", "228852", "98432", "22779", "20230", "109108", "217837", "15251", "76089", "18751", "170772", "330192", "108960", "108737", "239667", "12725", "14011", "14479", "12043", "70122", "235283", "20851", "225888", "24127", "12477", "NA", "78798", "240354", "237860", "108058", "12125", "100040266", "433855", "226922", "80707", "14269", "NA", "68652", "94212", "64380", "108937", "26896", "83490", "20848", "192159", "20849", "21417", "20817", "98952", "230594", "12774", "NA", "70315", "226251", "212285", "208104", "76499", "83997", "17977", "22778", "16452", "14945", "NA", "209086", "240174", "105203", "12399", "20649", "217692", "12394", "20491", "56224", "20688", "26401", "17886", "21942", "18099", "432486", "11538", "102637787", "14938", "11492", "76707", "15357", "21813", "229473", "NA", "170768", "227333", "71302", "17859", "22031", "30940", "106583", "217864", "77087", "329877", "244059", "230861", "NA", "11982", "106585", "74493", "19654", "12330", "22284", "76295", "109263", "68421", "50771", "30945", "12326", "70797", "119086081", "16477", "21372", "224860", "100504727", "225055", "108723", "NA", "69955", "235567", "403202", "71704", "235442", "19229", "23806", "NA", "239510", "18761", "23797", "231986", "53416", "226517", "140580", "22234", "233789", "67245", "226641", "270685", "213988", "245944", "100710", "11306", "67138", "11774", "213054", "20893", "NA", "19419", "20128", "12505")
+gene_numbers_vector <- c("17750", "17748", "12261", "18148", "18102", "276770", "17975", "17319", "18813", "67945", "231507", "20810", "15528", "21819", "21991", "70769", "20539", "22163", "15510", "21942", "100125262", "13723", "19385", "17751", "15519", "20318", "11898", "270106", "14958", "17869", "74747", "20116", "108737", "54215", "224829", "100126819", "16184", "19951", "12571", "16963", "433855", "12477", "16438", "15384", "20708", "16785", NA, "14939", "66141", "67427", "16477", "216238", "14433", "320790", "110074", "20848", NA, "270685", "119086081", "226922", "14938", "11938", "18227", "11987", "233489", "239667", NA, "59026", "19240", "11928", "226251", "16162", "20723", "110651", "20893", "54167", "13024", "12330", "78798")
+gene_numbers_vector3DR <- c("224829", "16438", NA, "16184", "16706", "19883", "217837", "20539", "667604", "11938", "105445", "67095", "16162", "12282", "63955", "100019", NA, "433855", "330050", "22042", "407821", "16197", "20525", "12477", "74370", "14229", "20230", "16842", "239667", "230249", "192159", "21942", "68703", "320586", "56458", "13121", "15251", "16709", "22031", "12725", "231549", "98910", "57258", "226519", "15357", "19386", "11352", "68564", "320207", "94212", "18669", "12330", "12571", "14453", "11987", "70686", "14536", "13175", "108116", "329908", "13046", "214897", "105203", "12317", "16421", "56463", "107358", "107022", "218756", "119086081", "68339", "100124672", "237877", "59026", "11534", "18130", "17909", "67269", "214812", "228850", "225997", "57815", "226412", "15510", "239273", "242474", NA, "414872", "14011", "54712", "12043", "11990", "11928", "19296", "77044", "236915", "118449", "23806", "80707", "70769", "13837", "21814", "50771", "269437", "21763", "319448", "12505", "21411", "208449", "241915", "12399", "12326", "72371", "68652", "211499", "81910", "21819", NA, "54167", "19157", "224008", "243362", "75302", "243385", "20848", "21844", "235542", "319651", "56224", "214133", "71302", "212391", "207375", "74340", "217340", "78943", "21951", "14939", "71365", "108150", "80898", "227937", "68750", "320790", "20320", "98432", "207742", "50790", "226922", "76295", NA, "74440", "72144", "20723", "17974", "233833", "100125248", "110521", "18181", "16001", "20527", "232906", "68059", "11538", "14479", "224088", "68421", NA, "12048", "83997", "18033", "52588", "195018", "54698", "70357", "271564", "209707", "70797", "140780", "110651", "12775", "18706", "319758", "30945", "432486", "20851", "109108", "22163", "216560", "19377", "19878", "15384", "68770", "74206", "20893", "71521", "14537", "67867", "235283", "14198", "276770", "52552", "81000", "67785", "101148", "74121", "59079", "18139", "81004", "72033", "217864", "21813", "77987", "102638869", "106557447", "76007", "20708", "16195", "74747", "69562", "321019", "94219", "69955", "20663", "228911", "69334", NA, "27392", "70472", NA, "56030", "544963", "17748", "100113414", "16412", "320244", "72747", "74493", "171170", "17127", "230861", "50720", "20440", "13424", "18015", "18019", "20361", "78808", "15975", "433586", "218454", "107895", "18099", "78757", "94249", "271981", "192195", "208727", "18826", "108946", "54446", "18148", "110157", "19206", "17977", "226517", "100124673", "83925", "140780", "140780", "102442", "244049", "100124675", "68169", "58800", "69206", "240354", "71782", "237860", "77446", "102442", "244049", "100124675", "68169", "58800", "69206", "13139", "75320", "102636275", "208154", "264064", "270685", "20720", "229603", "634322", "15894", "67285", "194388", "75547", "72386", "13482", "330192", "16963", "627171", "17869", "20318", "329324", "16411", "12180", "100124684", "12776", "18124", "547420", "20810", "15505", "14042", "15370", "17886", "22339", "19385", "12393", "17750", "17751", "64380", NA, "16431", "110074", "67448", NA)
+gene_numbers_vector2DR <- c("224829", "20440", "16401", "110651", "16438", "667604", "72386", "433022", "107022", "228012", "16764", "13837", "14198", "20447", "60504", "242819", "414872", "13723", "100124673", "75747", "627171", "54167", "19883", "434197", "18613", "228852", "208154", "98432", "22779", "20230", "109108", "217837", "12775", "15251", "76089", "13196", "11534", "18751", "170772", "330192", "30925", "108960", "100124679", "108737", "239667", "12048", "12725", "14011", "14479", "12043", "18578", "70122", "16421", "235283", "20851", "225888", "24127", "12477", "NA", "18015", "66860", "78798", "240354", "17974", "237860", "118568201", "108058", "12125", "14594", "17127", "100040266", "433855", "226922", "16197", "80707", "14269", "NA", "68652", "14049", "53313", "380711", "94212", "14229", "64380", "105445", "207742", "108937", "11835", "26896", "83490", "231549", "20848", "192159", "20849", "211401", "21417", "20817", "98952", "230594", "12774", "76499", "NA", "83997", "17977", "22778", "16452", "14945", "NA", "338363", "63955", "NA", "240174", "105203", "321019", "12399", "20649", "217692", "12394", "20491", "56224", "20688", "26401", "100124685", "114716", "17886", "667373", "16184", "21942", "18099", "432486", "11538", "102637787", "14938", "102632241", "67596", "94249", "11492", "76707", "108116", "15357", "18669", "21813", "229473", "NA", "170768", "227333", "71302", "227326", "66970", "21414", "227937", "16842", "208449", "17859", "22031", "212986", "21819", "17119", "30940", "622459", "98910", "77779", "407821", "241489", "NA", "106583", "269389", "77087", "329877", "67946", "244059", "230861", "NA", "11982", "106585", "50771", "67785", "30945", "12326", "71602", "320007", "75605", "70797", "119086081", "16477", "103214", "224860", "14453", "100504727", "225055", "108723", "NA", "72371", "54215", "140577", "69955", "230259", "NA", "235567", "16706", "403202", "235442", "19714", "23806", "NA", "NA", "14939", "212391", "21406", "68813", "108655", "67285", "100503085", "72475", "74340", "12180", "76897", "21949", "16154", "22427", "224008", "81000", "100125248", "18986", "60596", "77446", "264064", "15979", "14007", "19260", "11987", "71795", "15958", "18755", "667441", "19696", "14958", "232906", "12518", "56195", "NA", "102442", "NA", "100113414", "71776", "21814", "633740", "64213", "105246823", "433586", "NA", "627813", "234258", "16647", "21784")
+gene_numbers_vector3AL <- c("76747", "56758", "228765", "667476", "20303", "15507", "13654", "14260", NA, "20846", "386450", "16410", "76850", "18755", "215114", NA, "100124349", "15902", "436479", NA, "100126459", "320739", "17086", NA, "20198", "20024", "217578", "654836", "19240", "12794", "14652", "545384", "320495", "15978", "22288", "21946", "67427", "14960", "20750", "16994", "20307", "434341", "74558", "26943", "72238", "328232", "268288", "100126819", "16765", "243219", "20238", "244667", "243655", "19664", "108670", "106585", "22436", "110829", "638566", "110637", "218397", "54343", "20452", "20195", "242126", "16439", "382253", "240427", "16642", "269774", "97165", "674098", "54208", "109934", "20304", "109115", "240641", "21888", "53618", "12503", "20200", "74735", "19951", "70834", "12925", "83671", "68151", "18647", "60361", "56419", "17258", "18003", "22186", "12289", "76933", "267019", "109700", "94176", "18186", "16476", "71375", "57781", "14972", "11941", "16768", "20660", "74007", "234258", "68691", "19241", "12394", "20336", "14109", "16551", "76117", "100702", "16643", "269346", "12495", "16852", "394430", "78473", "252838", "20088", "213742", "20194", "80901", "16641", "436467", "19272", "72828", "108154", "72472", "57257", "380921", "627777", "432572", "110454", "66940", "319468", "107350", "331004", "23833", "259302", "18750", "12502", "100041546", "29809", "14282", "17101", "72289", "12021", "72310", "77777", "100124659", "11735", "56490", "320365", "69993", "328066", "231986", "13417", "100124698", NA)
+
+
+##Kegg enrichment Analysis 
+kegg_enrichment <- enrichKEGG(
+  gene         = gene_numbers_vector3AL,
+  organism     = 'mmu',
+  keyType      = 'kegg',
+  pAdjustMethod = 'BH',
+  pvalueCutoff = 0.05
+)
+
+##Visulize kegg_data
+kegg_enrichment
+
+##Make Dot plot 
+dotplot(kegg_enrichment, title = "Cluster 3 - AL")
+ggsave(file="/data/home/brandon.oswald/act_cd8_naming/kegg_pathway/Cluster3AL.pdf", dpi = 600, width = 10, height = 10)
+
+## DoHeatMap (select genes of interst, for supplentmental figure )
+geneSets <- c("Bdh1", "Oxct1", "Myc", "Pdcd1", "Lag3", "Tigit", "Entpd1", "Cd101", "Cd38", "Zap70", "Nfatc1", "Tox", "Runx3", "Jak3","Tcf7", "Myb", "Il7r", "Cxcr5", "Icos", "Cd28", "Irf7", "Oas1a", "Stat1", "Apobec3","Gzmb", "Gzma", "Prf1", "Klrg1", "Cx3cr1", "Tbx21", "Zeb2", "Id2", "Prdm1", "Klrd1", "Klrg1", "Klrk1","Lag3", "Gzmb", "Ifng", "Foxp3", "Cs", "Cd44", "Sell", "Tcf7", "Tbx21", "Eomes", "Bcl6", "Id2", "Id3", "Stat3", "Stat4", "Prdm1", "Slamf6", "Cd27", "Ccr7", "Cx3cr1", "Klrg1", "Il7r", "Il2ra", "Tox", "Pdcd1", "Prf1", "Gzmb", "Ifng", "Tnf", "Acly", "Acss2", "Ldha", "Cpt1a", "Mpc1", "Mpc2", "Cs", "Slc25a1", "Acss1", "Hk2","Bdh1","Ifit1", "Ifit3","Cd69","Irf7", "Isg15", "Runx1", "Havcr2", "Fasl", "Nfatc1", "Gfi1", "S1pr1", "Nfatc3", "Notch2", "Cd48", "Dnmt1", "Irf1", "Cd244a", "Icam2", "Tbx21", "Cdca3", "Cdca7", "Cdk1", "Cdc25b", "Itgb7", "Ccnf", "Ccna2", "Crmp1", "Ezh2", "Sell", "Slamf6", "Hif1a","Tcf7", "Cxcr5", "Zeb2", "Tbx21", "Klrc1", "Cd44", "Pdcd1", "Cd160", "Cd38", "Pclaf", "Mki67", "Il7r", "Oasl1", "Pdcd1", "Lag3", "Tigit", "Entpd1", "Cd101", "Cd38", "Zap70", "Nfatc1", "Tox", "Runx3", "Prf1")
+geneSets <- c("Cd244a", "Icam2", "Tbx21", "Cdca3", "Cdca7", "Cdk1", "Cdc25b", "Itgb7", "Ccnf", "Ccna2", "Crmp1", "Ezh2", "Sell", "Slamf6", "Hif1a","Tcf7", "Cxcr5", "Zeb2", "Tbx21", "Klrc1", "Cd44", "Pdcd1", "Cd160", "Cd38", "Pclaf", "Mki67", "Il7r", "Oasl1", "Pdcd1", "Lag3", "Tigit", "Entpd1", "Cd101", "Cd38", "Zap70", "Nfatc1", "Tox", "Runx3", "Prf1")
+
+##Aggregate Expression (Run Aggregate Expression or Average and move to heatmap)
+avg_expression <- AggregateExpression(act_CD8_Tcells, return.seurat = TRUE ,features = geneSets, assays = "SCT")
+avg_expression
+
+##Average Expression (Run Aggreage Expression or Average and move to heatmap)
+avg_expression <- AverageExpression(act_CD8_Tcells, features = geneSets, return.seurat = TRUE, assays = "SCT", layer = "data")
+avg_expression
+
+# Create a color mapping function
+color_mapping <- colorRamp2(c(-2, 0, 2), c("blue", "white", "red"))
+
+# Create the heatmap
+# Extract normalized data for the "RNA" assay
+data_matrix <- GetAssayData(object = avg_expression, assay = "SCT", layer = "scale.data")
+data_matrix
+
+# Run Heatmap
+heat <- Heatmap(data_matrix,
+                col = color_mapping, 
+                name = "AL + DR Average Expression - Log Normalized",
+                cluster_rows = TRUE,  # As genes are a predefined set
+                show_row_names = TRUE,
+                show_column_names = TRUE, cluster_columns = TRUE, column_title = "Clusters", show_row_dend = TRUE,  heatmap_height = unit(9,"in"),
+                heatmap_width = unit(4.5,"in"),
+                row_names_gp = gpar(fontsize=8))
+heat
+
+##split heatmap based on diet
+Dronly <- readRDS("/data/home/brandon.oswald/rds_files/dietaryrestrictioncd8_only.rds")
+ALonly <- readRDS("/data/home/brandon.oswald/rds_files/adlibcd8only.rds")
+
+##Average Expression (Run Aggreage Expression or Average and move to heatmap)
+avg_expression <- AverageExpression(ALonly, features = geneSets, return.seurat = TRUE, assays = "SCT", layer = "data")
+avg_expression
+
+# Create a color mapping function
+color_mapping <- colorRamp2(c(-2, 0, 2), c("blue", "white", "red"))
+
+# Create the heatmap
+# Extract normalized data for the "RNA" assay
+data_matrix <- GetAssayData(object = avg_expression, assay = "SCT", layer = "scale.data")
+data_matrix
+
+# Run Heatmap
+heat <- Heatmap(data_matrix,
+                col = color_mapping, 
+                name = "AL Average Expression - Log Normalized",
+                cluster_rows = TRUE,  # As genes are a predefined set
+                show_row_names = TRUE,
+                show_column_names = TRUE, cluster_columns = TRUE, column_title = "Clusters", show_row_dend = TRUE,  heatmap_height = unit(9,"in"),
+                heatmap_width = unit(4.5,"in"),
+                row_names_gp = gpar(fontsize=8))
+heat
+
+
+## Code to start to get vlnplots to have stats
+DefaultAssay(act_CD8_Tcells) <- "SCT"
+VlnPlot(act_CD8_Tcells, assay = "SCT", features = "Cd44", split.by = "diet", idents = c("0","2","3"), slot = "scale.data")
+VlnPlot(non_sct_act_cd8_tcells, assay = "RNA", features = "Txn2")
+
+# re specify Idents to cluster_diet
+Idents(act_CD8_Tcells) <- pbmc_exp2$clust.diet
+Idents(act_CD8_Tcells)
+markers["Ccnf", "p_val"]
+
+##Make Vlns with SCT
+VlnPlot(act_CD8_Tcells, assay = "SCT", features = "sct_Bdh1", layer = "scale.data", split.by = "diet", idents = c("0", "1", "2", "3","4", "5", "6", "7"), sort = TRUE)
+
+##Subset AL and DR only cells into .rds file
+table(act_CD8_Tcells$diet)
+dietaryrestrictioncd8 <- subset(act_CD8_Tcells, x = "Caloric_Restriction")
+dietaryrestrictioncd8 <- subset(act_CD8_Tcells, subset = act_CD8_Tcells$diet == "Ad_libitum")
+adlibcd8 <- subset(act_CD8_Tcells, subset = diet == "Ad_libitum")
+dietaryrestrictioncd8 <- subset(act_CD8_Tcells, subset = diet == "Caloric_Restriction")
+saveRDS(adlibcd8, file = "/data/home/brandon.oswald/rds_files/adlibcd8only.rds")
+saveRDS(dietaryrestrictioncd8, file = "/data/home/brandon.oswald/rds_files/dietaryrestrictioncd8_only.rds")
+
+##FGSEA for differential gene expression list
+library(fgsea)
+E <- act_CD8_Tcells@reductions$pca@feature.loadings
+E
+
+library(msigdbr)
+
+pathwaysDF <- msigdbr("mouse", category="C2", subcategory = "CP:KEGG")
+pathways <- split(pathwaysDF$gene_symbol, pathwaysDF$gs_name)
+pathways
+set.seed(1)
+gesecaRes <- geseca(pathways, E, minSize = 5, maxSize = 500, center = FALSE, eps=1e-100)
+head(gesecaRes, 20)
+topPathways <- gesecaRes[, pathway] |> head(4)
+topPathways
+titles <- sub("KEGG_", "", topPathways)
+
+fgseaRes <- fgsea(pathways = pathways, 
+                  stats    = exampleRanks,
+                  minSize  = 15,
+                  maxSize  = 500)
+
+plotCoregulationProfile(pathway = topPathways, obj, title=titles,
+                        reduction="wnn.umap4")
+
+ps <- plotCoregulationProfile(pathways[topPathways], E,
+                                       title=titles)
+
+
+## plot polyfuncitonal genes
+plot0 <- plot_density(act_CD8_Tcells, features = c("Ifng","Gzmb","Tnf"), reduction = 'wnn.umap4')
+plot0 <- plot_density(act_CD8_Tcells, features = c("Ugcg"), reduction = 'wnn.umap4')
+plot0
+
+library(Nebulosa)
+plot_density(act_CD8_Tcells, features = "sct_Cd44", reduction = 'wnn.umap4')
+## This set of code is for identifying different basic myeloid populations 
+## Will need to subset cluster "Myeloid" and start new umap generations 
+DimPlot(pbmc_exp2, reduction = "wnn.umap2", label = TRUE)
+
+#Subset Myeloid cluster
+myeloid <- subset(pbmc_exp2, idents = c("7", "8", "15", "14", "15", "19"))
+myeloid
+
+## Diet Seurat, get rid of almost everything in DF
+DefaultAssay(myeloid) <- 'RNA'
+myeloid <-DietSeurat(myeloid, assays = c("RNA","ADT"))
+
+##Check Seurat Object, should have reduced metadata
+myeloid
+
+##Start new analysis on subset
+DefaultAssay(myeloid) <- 'RNA'
+myeloid <- SCTransform(myeloid, vars.to.regress = "percent.mt", verbose = FALSE)
+myeloid
+
+## Set SCT as default assay for future analysis and create pca plot
+DefaultAssay(myeloid) <- 'SCT'
+myeloid <- FindVariableFeatures(myeloid)
+myeloid <- RunPCA(myeloid, reduction.name = "pca", dims = 1:40, verbose = FALSE)
+
+##Check Myeloid
+myeloid
+
+DefaultAssay(myeloid) <- 'ADT'
+# we will use all ADT features for dimensional reduction
+# we set a dimensional reduction name to avoid overwriting the 
+VariableFeatures(myeloid) <- rownames(myeloid[["ADT"]])
+myeloid <- NormalizeData(myeloid, normalization.method = 'CLR', margin = 2) 
+myeloid <- ScaleData(myeloid)
+myeloid <- RunPCA(myeloid, reduction.name = 'apca', reduction.key = 'apca_', dims = 1:40, verbose = FALSE)
+myeloid
+
+# Identify multimodal neighbors. These will be stored in the neighbors slot, 
+# and can be accessed using bm[['weighted.nn']]
+# The WNN graph can be accessed at bm[["wknn"]], 
+# and the SNN graph used for clustering at bm[["wsnn"]]
+# Cell-specific modality weights can be accessed at bm$RNA.weight
+
+DefaultAssay(myeloid) <- 'SCT'
+
+myeloid <- FindMultiModalNeighbors(
+  myeloid, reduction.list = list("pca", "apca"), 
+  dims.list = list(1:40, 1:40)
+)
+
+## modality.weight.name = "RNA.weight" was removed from above and code ran. 
+myeloid <- RunUMAP(myeloid,nn.name = "weighted.nn", reduction.name = "wnn.umap", reduction.key = "wnnUMAP_")
+
+myeloid <- FindClusters(myeloid, graph.name = "wsnn", algorithm = 3, resolution = 0.4, verbose = FALSE)
+myeloid
+myeloid
+
+
+## View UMAP
+DimPlot(myeloid, reduction = 'wnn.umap', label = TRUE, repel = TRUE, label.size = 4)
+
+##Save Raw RDS file
+saveRDS(myeloid, file = "/data/home/brandon.oswald/rds_files/myeloid_raw.rds")
+readRDS(myeloid,file = "/data/home/brandon.oswald/rds_files/myeloid_raw.rds")
+myeloid
+FeaturePlot(myeloid, "Ly6c2", reduction = "wnn.umap", split.by = "diet")
+FeaturePlot(pbmc_exp_removed, "Ly6c2", reduction = "wnn.umap2", split.by = "diet")
+
+##Gene Lists for Myeloid cells
+FeaturePlot(pbmc_exp_removed, "Cadm1", reduction = "wnn.umap2")
+plot_density(myeloid, "Tlr8")
+pathways$C1qaTAM <- c("Uap1l1", "Fabp5", "Akr1a1", "Prdx1", "C1qb", "C1qc", "C1qa", "Apoe", "Ftl1", "Ctsd", "Cd81", "Cd63", "Ppia", "Npm1", "Ccl8", "Grn", "Timp2", "Lgmn", "Hexb", "Ctsb", "Lgals1", "Hmgn1", "Gm42418", "Trem2", "Ms4a7")
+pathways$H2ab1TAM <- c("Olfm1", "Set", "Cst3", "Fdps", "Naaa", "Ptms", "Ybx3", "Ifi30", "Rps27l", "C1qbp", "Atp5g1", "Psme2", "Tuba1b", "Ciita", "Sdf2l1", "Ranbp1", "H2-DMa", "H2-DMb1", "Psmb8", "H2-Ab1", "H2-Aa", "H2-Eb1", "Cd74", "Ppp1r14b", "Eef1g")
+pathways$HIF1aTAM <- c("Prdx6", "Vim", "Thbs1", "Smox", "Mafb", "S100a11", "Rbpj", "Cxcl2", "Clec4d", "Tpi1", "Bnip3", "Adam8", "F10", "Msr1", "Ccr1", "Srgn", "Slc16a3", "Hif1a", "Card19", "Ero1l", "Basp1", "Ier3", "Emilin2", "Cd14", "Pgk1")
+pathways$IFNresponseTAM <- c("Stat1", "Ifi209", "Ifi204", "Mndal", "Ifi211", "Ifi203", "Samhd1", "Zbp1", "Gbp5", "Gbp7", "Gbp3", "Gbp2", "Isg15", "Fgl2", "Cxcl10", "Zyx", "Trim30a", "Ifi47", "Igtp", "Slfn5", "Slfn1", "Pnp", "Tap1", "Ms4a4c", "Ms4a6d")
+pathways$ly6cnegmono <- c("Stap1", "Grk3", "Dusp16", "Pglyrp1", "Pou2f2", "Ceacam1", "Spn", "Itgal", "Klf2", "S1pr5", "Myo1g", "Stk10", "Eno3", "Gngt2", "Ace", "Cd300e", "Hfe", "Ear2", "Nr4a1", "Krt80", "Samsn1", "Stk38", "Treml4", "Adgre4")
+pathways$ly6cposmono <- c("Ramp1", "Fam129a", "Itga4", "Gm9733", "Plac8", "Rassf4", "Mgst1", "Akap13", "Ifitm6", "Gsr", "Adgre5", "Hp", "Sorl1", "Ifngr1", "Sbno2", "Lyz2", "Fos", "Asap1", "Ly6c2", "Nfam1", "Cebpd", "Arhgef37", "Cdk2ap2", "Add3", "Nhsl2")
+pathways$stressrespTAM <- c("Rgs1", "Tmem189", "Tiparp", "Plin2", "Slc2a1", "Hilpda", "Bhlhe40", "Clec4d", "Emp1", "Bnip3", "Hmox1", "Mt1", "Mif", "Osbpl8", "Gna13", "Ifrd1", "Lhfpl2", "Ero1l", "Lgals3", "Il7r", "Basp1", "Ndrg1", "Vegfa", "Fth1", "Gla")
+geneSets <- c("C1qa", "Ly6c2", "H2-Ab1", "Cd14")
+
+
+# How many cells are in each cluster
+table(Idents(myeloid))
+
+
+# What proportion of cells are in each cluster?
+prop.table(table(Idents(myeloid)))
+
+# How does cluster membership vary by replicate?
+table(Idents(pbmc_removed_clusters), pbmc_removed_clusters$diet)
+table(Idents(myeloid), myeloid$diet)
+DimPlot(pbmc_exp2, reduction = "wnn.umap2", label = T, split.by = "diet")
+
+# What proportion of cells are in each cluster by diet
+test <-prop.table(table(Idents(myeloid), myeloid$diet), margin = 2)
+test
+
+# What proportion of cells are in each cluster by diet
+cellsbydiet <-prop.table(table(Idents(myeloid), myeloid$diet), margin = 2)
+cellsbydiet
+
+
+##Heatmap for CD45 dataset
+DimPlot(pbmc_exp_removed, reduction = "wnn.umap2")
+
+## DoHeatMap (masterlist for CD45+ T cells)
+geneSets <- c("Cx3cr1", "sct_Nk1.1", "Il2ra", "Il7r","Cd8a", "Cd4", "Tox", "Gzmb", "Pdcd1", "Cd68", "Itgam", "H2-Ab1", "Prdx1", "C1qb", "C1qc", "C1qa", "Apoe", "C1qa", "Ly6c2", "Klrb1c", "Gzma", "Ncr1", "Ear2", "Atp6v0d2", "Mrc1", "Spp1", "Fabp4", "Ctsk", "S100a9", "S100a8", "G0s2", "Ptgs2", "Cd3g", "Cd3d", "Cd3e", "Trac", "Trbc2", "Naaa", "Batf3", "Itgae", "Cd209a", "Ccr2", "Ms4a4c", "F13a1","Vcan", "Clec4a1", "Gzma", "Ccl5", "Nkg7","Klre1", "Ncr1", "Klre1", "Ncr1", "Klrk1", "Prf1","Klrb1c", "Lef1", "Igfbp4", "Ccr7", "S1pr1", "Sell", "Prf1", "Gzmb", "")
+pathways$C1qaTAM <- c("Uap1l1", "Fabp5", "Akr1a1", "Prdx1", "C1qb", "C1qc", "C1qa", "Apoe", "Ftl1", "Ctsd", "Cd81", "Cd63", "Ppia", "Npm1", "Ccl8", "Grn", "Timp2", "Lgmn", "Hexb", "Ctsb", "Lgals1", "Hmgn1", "Gm42418", "Trem2", "Ms4a7")
+pathways$H2ab1TAM <- c("Olfm1", "Set", "Cst3", "Fdps", "Naaa", "Ptms", "Ybx3", "Ifi30", "Rps27l", "C1qbp", "Atp5g1", "Psme2", "Tuba1b", "Ciita", "Sdf2l1", "Ranbp1", "H2-DMa", "H2-DMb1", "Psmb8", "H2-Ab1", "H2-Aa", "H2-Eb1", "Cd74", "Ppp1r14b", "Eef1g")
+pathways$HIF1aTAM <- c("Prdx6", "Vim", "Thbs1", "Smox", "Mafb", "S100a11", "Rbpj", "Cxcl2", "Clec4d", "Tpi1", "Bnip3", "Adam8", "F10", "Msr1", "Ccr1", "Srgn", "Slc16a3", "Hif1a", "Card19", "Ero1l", "Basp1", "Ier3", "Emilin2", "Cd14", "Pgk1")
+pathways$IFNresponseTAM <- c("Stat1", "Ifi209", "Ifi204", "Mndal", "Ifi211", "Ifi203", "Samhd1", "Zbp1", "Gbp5", "Gbp7", "Gbp3", "Gbp2", "Isg15", "Fgl2", "Cxcl10", "Zyx", "Trim30a", "Ifi47", "Igtp", "Slfn5", "Slfn1", "Pnp", "Tap1", "Ms4a4c", "Ms4a6d")
+pathways$ly6cnegmono <- c("Stap1", "Grk3", "Dusp16", "Pglyrp1", "Pou2f2", "Ceacam1", "Spn", "Itgal", "Klf2", "S1pr5", "Myo1g", "Stk10", "Eno3", "Gngt2", "Ace", "Cd300e", "Hfe", "Ear2", "Nr4a1", "Krt80", "Samsn1", "Stk38", "Treml4", "Adgre4")
+pathways$ly6cposmono <- c("Ramp1", "Fam129a", "Itga4", "Gm9733", "Plac8", "Rassf4", "Mgst1", "Akap13", "Ifitm6", "Gsr", "Adgre5", "Hp", "Sorl1", "Ifngr1", "Sbno2", "Lyz2", "Fos", "Asap1", "Ly6c2", "Nfam1", "Cebpd", "Arhgef37", "Cdk2ap2", "Add3", "Nhsl2")
+pathways$stressrespTAM <- c("Rgs1", "Tmem189", "Tiparp", "Plin2", "Slc2a1", "Hilpda", "Bhlhe40", "Clec4d", "Emp1", "Bnip3", "Hmox1", "Mt1", "Mif", "Osbpl8", "Gna13", "Ifrd1", "Lhfpl2", "Ero1l", "Lgals3", "Il7r", "Basp1", "Ndrg1", "Vegfa", "Fth1", "Gla")
+
+##Markers form thales paper macrophages
+c("Ear2", "Atp6v0d2", "Mrc1", "Spp1", "Fabp4", "Ctsk")
+##Neutrophils
+c("S100a9", "S100a8", "G0s2", "Ptgs2")
+##T cells
+c("Cd3g", "Cd3d", "Cd3e", "Trac", "Trbc2")
+##cDCs
+c("Naaa", "Batf3", "Itgae", "Cd209a")
+##Monocyte
+c("Ccr2", "Ms4a4c", "F13a1","Vcan", "Clec4a1")
+##NKcells
+c("Gzma", "Ccl5", "Nkg7","Klre1", "Ncr1", "Klre1", "Ncr1", "Klrk1", "Prf1","Klrb1c")
+##CD4 Naive
+c("Lef1", "Igfbp4", "Ccr7", "S1pr1", "Sell")
+
+##Start heatmap code here, similar to before 
+avg_expression <- AverageExpression(pbmc_exp_removed, features = geneSets, return.seurat = TRUE, assays = "SCT", slot = "data")
+class(avg_expression)  # Should be 'Seurat'
+
+## Additional Heatmap, it is contingent on running the previous heatmap. 
+library(circlize)
+
+# Create a color mapping function
+color_mapping <- colorRamp2(c(-2, 0, 2), c("blue", "white", "red"))
+class(avg_expression)
+matrix_heatmap <- as.matrix(avg_expression)
+
+# Create the heatmap
+# Extract normalized data for the "RNA" assay
+data_matrix <- GetAssayData(object = avg_expression, assay = "SCT", slot = "scale.data")
+class(data_matrix)
+
+library(ComplexHeatmap)
+# Run Heatmap
+
+heat <- Heatmap(data_matrix,
+                col = color_mapping, 
+                name = "Expression Level",
+                cluster_rows = TRUE,  # As genes are a predefined set
+                show_row_names = TRUE,
+                show_column_names = TRUE, cluster_columns = TRUE, column_title = "Clusters", show_row_dend = TRUE,  heatmap_height = unit(5,"in"),
+                heatmap_width = unit(2.5,"in"),
+                row_names_gp = gpar(fontsize=5))
+heat
+
+ggsave(file="/data/home/brandon.oswald/heatmapofcd45_heatmap.pdf", dpi = 600, width = 6, height = 6)
+
+
+
+
+plot_density(act_CD8_Tcells, "adt_CD279-(PD-1)-RMP1-30")
+FeaturePlot(act_CD8_Tcells, "Slamf6", min.cutoff = "q10", max.cutoff = "q90")
+
+geneSets <- c("adt_NK-1.1-PK136", "adt_Ly-6C-HK1.4", "adt_CD223-(LAG-3)-C9B7W", "adt_CD4-RM4-5", "adt_CD8a-53-6.7", "adt_CD279-(PD-1)-RMP1-30", "adt_F4-80-BM8", "adt_CD11c-N418", "adt_CD366-(Tim-3)-RMT3-23", "adt_human-CD11b-M1-70", "adt_CD69-H1.2F3", "adt_CD127-(IL-7Ralpha)-A7R34")
+geneSets <- c("Cd8a")
+#Plotdensity for Cd45 select genes
+for (geneSet in geneSets){
+  plot0 <- plot_density(pbmc_exp_removed,features = geneSet, reduction = 'wnn.umap2')
+  plot0
+  ggsave(file=paste0("/data/home/brandon.oswald/cd45 naming/density_rna/",geneSet,"density_plot.pdf"), dpi = 600, width = 6, height = 6)
+}
+
+
+
+##Dot Plot, code use to look at different genes of interest using different RDS files 
+
+DotPlot(act_CD8_Tcells,features = c("Cdk1", "Mki67", "Ifng", "Tnf", "Gzmb", "Prf1", "Pdcd1", "Havcr2", "Tox", "Lag3", "Cd44"), 
+        cluster.idents = T) + RotatedAxis() + coord_flip() + scale_colour_gradient2(low = "Blue3", mid = "gray99", high = "red4")
+
+DotPlot(act_CD8_Tcells, assay = "SCT" ,idents = c( "3", "2"), dot.scale = ,scale.min = 0, scale.max = 100,features = c("Cdk1", "Mki67", "Ifng", "Tnf", "Gzmb", "Prf1", "Pdcd1", "Havcr2", "Tox", "Lag3", "Cd44"), 
+        cluster.idents = T, ) + RotatedAxis() + coord_flip() + scale_colour_gradient2(low = "Blue3", mid = "gray99", high = "red4") 
+
+
+
+
