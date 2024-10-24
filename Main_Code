@@ -1,9 +1,10 @@
 ## This project is used process the AL vs CR CITE_Seq experiment looking at CD45 TILs. 
 ## Author: Brandon Oswald
 ## Date: 31JAN2023-24OCT2024
+## Contact: brandon.oswald@vai.edu
 
-##Notes, I routinely used the orginal naming convention from the source I used this from. Naming of the seurat single cell matrix's could be changed to be more reflective of our actual data. I used pbmc_exp2 a lot,
-In realty, it just a holder for my AL vs DR TIL data. 
+##Notes, I routinely used "pbmc_exp2" as the object in which I saved my AL vs DR CITE-Seq data. They are not actual pbmc's. The object makes up the 
+CD45+ TILs that were isolated per our paper (Reference to come). 
 
 ##Load RDS files relevant for your work. If interested in processed CD45 cells, use that, if just CD8 use that. The choice is yours.
 pbmc_exp2 <- readRDS("location of your RDS file. I have RDS files saved with Zenodo for quick access")
