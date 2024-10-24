@@ -6,3 +6,9 @@ Reference to come
 # Abstract
 
 (coming soon)
+
+# GEO ID
+https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE267070
+
+# Zenodo link
+https://zenodo.org/records/13920173
