@@ -13,6 +13,6 @@ https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE267070
 # Zenodo link
 https://zenodo.org/records/13920173
 
-# Citation's
+# Citation 
 https://satijalab.org/seurat/articles/hashing_vignette.html 
 Satijalab was used a lot for helping with code development. 
