@@ -2,7 +2,9 @@
 CD45+ TILs from AL and DR Tumors (B16-OVA Melanoma) 
 
 BioRxiv: https://doi.org/10.1101/2024.11.14.621733
-(PMID: TBD)
+(PMID: 39605550
+<img width="67" height="26" alt="image" src="https://github.com/user-attachments/assets/a9c7ff6c-55ec-4dec-970f-37a4021715bf" />
+)
 
 # Abstract
 
