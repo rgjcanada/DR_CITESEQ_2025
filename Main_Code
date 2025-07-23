@@ -1,9 +1,9 @@
-## This project is used process the AL vs CR CITE_Seq experiment looking at CD45 TILs. 
+## This project is used process the AL vs DR CITE_Seq experiment looking at CD45 TILs. 
 ## Author: Brandon Oswald
 ## Date: 31JAN2023-24OCT2024
 ## Contact: brandon.oswald@vai.edu
 ## Notes: I routinely used "pbmc_exp2" as the object in which I saved my AL vs DR CITE-Seq data. They are not actual pbmc's. The object makes up the 
-CD45+ TILs that were isolated per our paper (Reference to come). This code was utilized for the majority of the analysis presented in my paper. I have reviewed 
+CD45+ TILs that were isolated per our paper (https://www.biorxiv.org/content/10.1101/2024.11.14.621733v1.article-metrics). This code was utilized for the majority of the analysis presented in my paper. I have reviewed 
 and refined it by removing redundant sections and elements that were intended for personal reference. Please note that there are instances where I 
 alternated between subsetting the data and performing the analysis. I am providing this code as a reference framework. You may need to modify it to suit 
 your specific requirements.
